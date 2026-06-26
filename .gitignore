@@ -1,0 +1,286 @@
+# ============================================================
+# .gitignore — Forex Trading Bot
+# RTX 3050 | AMD Ryzen 7 | Python / PyTorch
+# ============================================================
+
+
+# ── CREDENTIALS & SECRETS ───────────────────────────────────
+# NEVER commit these — broker/API keys, passwords
+.env
+.env.*
+!.env.example
+config/broker_credentials.env
+config/secrets.yaml
+secrets/
+*.pem
+*.key
+*.p12
+*.jsonl
+
+
+# ── MODEL CHECKPOINTS & WEIGHTS ─────────────────────────────
+# Large binary files — use Git LFS or cloud storage instead
+checkpoints/
+exports/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.tflite
+*.pb
+*.pkl
+decision_model_*.*
+causal_*.*
+*.sha256
+
+
+# ── DATASET & CHART IMAGES ───────────────────────────────────
+# Generated data — reproducible from raw CSVs via build_dataset.py
+data/
+data/charts/
+data/raw/
+data/metadata/
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+# Exception: keep sample images for README
+!docs/images/
+!docs/images/*.png
+
+
+# ── RAW MARKET DATA ──────────────────────────────────────────
+*.csv
+*.csv.*
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.json
+# Exception: keep small example/fixture CSVs
+!tests/fixtures/*.csv
+!examples/*.csv
+*.log
+
+
+# ── PYTHON ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.pyc
+.Python
+build/
+dist/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+pip-wheel-metadata/
+share/python-wheels/
+.installed.cfg
+
+
+# ── VIRTUAL ENVIRONMENTS ─────────────────────────────────────
+vit_env/
+venv/
+env/
+.venv/
+.env/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+conda-env/
+
+
+# ── JUPYTER NOTEBOOKS ────────────────────────────────────────
+# Keep .ipynb files but strip outputs
+.ipynb_checkpoints/
+# Uncomment below to fully ignore notebooks:
+# notebooks/
+
+
+# ── LOGS & MONITORING ────────────────────────────────────────
+logs/
+*.log
+*.log.*
+runs/                    # TensorBoard runs
+wandb/                   # Weights & Biases local files
+mlruns/                  # MLflow
+lightning_logs/
+events.out.tfevents.*
+
+
+# ── NUMBA CACHE ──────────────────────────────────────────────
+# Numba JIT compilation cache — regenerates automatically
+__pycache__/
+.numba_cache/
+numba_cache/
+*.nbi
+*.nbc
+
+
+# ── PROFILING & BENCHMARKING ─────────────────────────────────
+*.prof
+*.lprof
+*.stats
+profile_output/
+benchmarks/results/
+
+
+# ── DATABASE FILES ───────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+# TimescaleDB / PostgreSQL dumps
+*.dump
+*.backup
+
+
+# ── REDIS ────────────────────────────────────────────────────
+dump.rdb
+*.rdb
+
+
+# ── DOCKER ───────────────────────────────────────────────────
+# Keep Dockerfile and docker-compose.yml — ignore runtime artifacts
+.docker/
+docker-data/
+
+
+# ── OPERATING SYSTEM ─────────────────────────────────────────
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+
+# ── IDE & EDITORS ────────────────────────────────────────────
+# VS Code / Windsurf
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim / Neovim
+*.swp
+*.swo
+*.swn
+Session.vim
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+
+
+# ── TESTING ──────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+nosetests.xml
+test-results/
+test-reports/
+
+
+# ── TEMPORARY FILES ──────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.orig
+*.rej
+
+
+# ── SOCIAL MEDIA ASSETS ──────────────────────────────────────
+# Auto-generated charts for Twitter/LinkedIn/Telegram posts
+social/generated/
+social/assets/temp/
+/tmp/*.png
+/tmp/equity_curve.*
+
+
+# ── OPTUNA HYPERPARAMETER SEARCH ─────────────────────────────
+optuna_studies/
+optuna.db
+*.optuna
+
+
+# ── ONNX RUNTIME CACHE ───────────────────────────────────────
+.onnxruntime/
+onnxruntime_profile_*.json
+
+
+# ── DISTRIBUTION / PACKAGING ─────────────────────────────────
+.tox/
+.nox/
+.cache/
+htmldoc/
+docs/_build/
+site/
+
+
+# ── LARGE MEDIA (if any) ─────────────────────────────────────
+*.mp4
+*.mov
+*.avi
+*.gif
+
+
+# ============================================================
+# WHAT IS INTENTIONALLY TRACKED (kept in git):
+# ============================================================
+# ✅ config/hardware_config.yaml  — hardware settings (no secrets)
+# ✅ config/trading_config.yaml   — trading parameters
+# ✅ .env.example                 — template with placeholder values
+# ✅ src/*.py                     — all source code
+# ✅ tests/                       — all test code
+# ✅ requirements.txt             — dependencies
+# ✅ Dockerfile                   — container definition
+# ✅ docker-compose.yml           — service definitions
+# ✅ README.md                    — documentation
+# ✅ train.py                     — main entry point
+# ✅ .gitignore                   — this file
+# ============================================================
