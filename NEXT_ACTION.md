@@ -27,6 +27,34 @@ Stage 10 — Production Gate
 - Failed walk-forward — needs re-discovery with better regime filtering
 - BTC has deepest data, lowest costs, best execution quality
 
+## Next Steps
+
+1. **Run In-Sample Discovery Experiment for `btc_mr_l2`**:
+   ```python
+   from src.core.experiment_manager import ExperimentManager
+   manager = ExperimentManager()
+   manager.run_single(hypothesis="btc_mr_l2", symbol="BTCUSDT", timeframe="15m")
+   ```
+
+2. **Check the Status of the Experiment**:
+   ```bash
+   python scripts/show_status.py          # Pipeline summary
+   python scripts/show_evidence_scores.py # Multi-dimensional scores
+   ```
+
+3. **Populate the Knowledge Base with the Experiment Results**:
+   ```python
+   from src.core.knowledge_base import knowledge_base, Observation
+   knowledge_base.add(Observation(
+       observation_id="obs_009",
+       statement="OI expansion + price breakout predicts continuation on 15m BTC",
+       domain="open_interest",
+       confidence=2,
+       supporting_experiments=["exp_pos_001_btc_15m"],
+       related_hypotheses=["pos_001"],
+   ))
+   ```
+
 ## Priority 2: Run Experiments on Program A (Open Interest + Funding)
 
 The highest-expected-value research program. Use the experiment manager:
