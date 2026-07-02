@@ -284,3 +284,4 @@ site/
 # ✅ train.py                     — main entry point
 # ✅ .gitignore                   — this file
 # ============================================================
+.aider*
