@@ -37,10 +37,17 @@ OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 # Common aliases seen in exported candle data → canonical name.
 _COLUMN_ALIASES = {
-    "time": "timestamp", "ts": "timestamp", "date": "timestamp",
-    "datetime": "timestamp", "t": "timestamp",
-    "o": "open", "h": "high", "l": "low", "c": "close",
-    "v": "volume", "vol": "volume",
+    "time": "timestamp",
+    "ts": "timestamp",
+    "date": "timestamp",
+    "datetime": "timestamp",
+    "t": "timestamp",
+    "o": "open",
+    "h": "high",
+    "l": "low",
+    "c": "close",
+    "v": "volume",
+    "vol": "volume",
 }
 
 
@@ -51,7 +58,9 @@ class OHLCVValidationError(ValueError):
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Lower-case column names and apply the alias map."""
     df = df.rename(columns={c: str(c).strip().lower() for c in df.columns})
-    df = df.rename(columns={k: v for k, v in _COLUMN_ALIASES.items() if k in df.columns})
+    df = df.rename(
+        columns={k: v for k, v in _COLUMN_ALIASES.items() if k in df.columns}
+    )
     return df
 
 
@@ -60,16 +69,26 @@ def _coerce_timestamp(series: pd.Series) -> pd.Series:
     Coerce a timestamp column to unix *seconds* as int64.
 
     Accepts: unix seconds, unix milliseconds (auto-detected by magnitude),
-    or anything pandas can parse as a datetime.
+    datetime objects, or anything pandas can parse as a datetime.
     """
     if pd.api.types.is_numeric_dtype(series):
         vals = series.astype("int64")
         # Heuristic: values > ~year 2100 in seconds are almost certainly ms.
-        if (vals > 4_102_444_800).mean() > 0.5:
-            vals = vals // 1000
+        # Year 2100 in seconds = 4,102,444,800; in ms = 4,102,444,800,000
+        if (vals > 4_102_444_800_000).mean() > 0.5:
+            vals = vals // 1_000_000  # ms → seconds
+        elif (vals > 4_102_444_800).mean() > 0.5:
+            vals = vals // 1_000  # seconds → still seconds (already correct)
         return vals
-    # Fall back to datetime parsing.
-    dt = pd.to_datetime(series, utc=True, errors="coerce")
+    # Handle datetime objects (e.g., from dataset_registry index reset).
+    if pd.api.types.is_datetime64_any_dtype(series):
+        dt = pd.to_datetime(series, utc=True, errors="coerce")
+        if dt.isna().any():
+            raise OHLCVValidationError("timestamp column has unparseable values")
+        return (dt.astype("int64") // 1_000_000_000).astype("int64")
+    # Fall back to string/other parsing with explicit unit='s' for numeric-like strings.
+    s = series.astype(str).str.strip()
+    dt = pd.to_datetime(s, utc=True, errors="coerce")
     if dt.isna().any():
         raise OHLCVValidationError("timestamp column has unparseable values")
     return (dt.astype("int64") // 1_000_000_000).astype("int64")
@@ -131,7 +150,9 @@ def validate_ohlcv(df: pd.DataFrame, *, symbol: str = "?") -> pd.DataFrame:
             logger.warning(
                 "[%s] %d timestamp gap(s) detected (modal bar = %ds). "
                 "Gaps are NOT interpolated — equity curve will skip them.",
-                symbol, gaps, modal,
+                symbol,
+                gaps,
+                modal,
             )
     return df
 
