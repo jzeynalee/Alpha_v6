@@ -69,23 +69,29 @@ def _coerce_timestamp(series: pd.Series) -> pd.Series:
     Coerce a timestamp column to unix *seconds* as int64.
 
     Accepts: unix seconds, unix milliseconds (auto-detected by magnitude),
-    datetime objects, or anything pandas can parse as a datetime.
+    or anything pandas can parse as a datetime.
     """
     if pd.api.types.is_numeric_dtype(series):
         vals = series.astype("int64")
         # Heuristic: values > ~year 2100 in seconds are almost certainly ms.
-        # Year 2100 in seconds = 4,102,444,800; in ms = 4,102,444,800,000
-        if (vals > 4_102_444_800_000).mean() > 0.5:
-            vals = vals // 1_000_000  # ms → seconds
-        elif (vals > 4_102_444_800).mean() > 0.5:
-            vals = vals // 1_000  # seconds → still seconds (already correct)
+        if (vals > 4_102_444_800).mean() > 0.5:
+            vals = vals // 1000
         return vals
-    # Handle datetime objects (e.g., from dataset_registry index reset).
+    # Handle datetime objects (from dataset_registry index reset).
     if pd.api.types.is_datetime64_any_dtype(series):
-        dt = pd.to_datetime(series, utc=True, errors="coerce")
-        if dt.isna().any():
-            raise OHLCVValidationError("timestamp column has unparseable values")
-        return (dt.astype("int64") // 1_000_000_000).astype("int64")
+        # .astype("int64") on datetime64 gives seconds if resolution is seconds
+        # (e.g., CSV timestamps loaded as datetime64[s]).
+        dt_ns = (series.values.view("int64")).astype("int64")
+        # Heuristic: if values look like Unix seconds (between year 2000 and 2100), use as-is.
+        if (dt_ns > 946_684_800).mean() > 0.5 and (dt_ns < 4_102_444_800).mean() > 0.5:
+            return dt_ns
+        # Otherwise treat as nanoseconds, convert to seconds.
+        return (dt_ns // 1_000_000_000).astype("int64")
+    # Fall back to datetime parsing.
+    dt = pd.to_datetime(series, utc=True, errors="coerce", unit="s")
+    if dt.isna().any():
+        raise OHLCVValidationError("timestamp column has unparseable values")
+    return (dt.astype("int64") // 1_000_000_000).astype("int64")
     # Fall back to string/other parsing with explicit unit='s' for numeric-like strings.
     s = series.astype(str).str.strip()
     dt = pd.to_datetime(s, utc=True, errors="coerce")

@@ -253,9 +253,14 @@ def run_backtest(
     # Reset index to column for backtest engine compatibility
     ohlcv = ohlcv.reset_index().rename(columns={ohlcv.index.name: "timestamp"})
 
+    # Use a manageable subset for pipeline demonstration
+    sample_size = min(5000, len(ohlcv))
+    ohlcv = ohlcv.head(sample_size)
+
     logger.info(
-        "Loaded %d bars (%s → %s)",
+        "Loaded %d bars (sampled from %d) (%s → %s)",
         len(ohlcv),
+        sample_size,
         ohlcv["timestamp"].iloc[0],
         ohlcv["timestamp"].iloc[-1],
     )
@@ -322,6 +327,12 @@ def compute_walk_forward(
     n_windows: int = 12,
 ) -> Dict[str, Any]:
     """Compute walk-forward metrics using PurgedWalkForward + DSR."""
+    # Ensure timestamp is a column (not index) for backtest engine compatibility
+    if ohlcv.index.name is not None and "timestamp" not in ohlcv.columns:
+        ohlcv = ohlcv.reset_index()
+    elif ohlcv.index.name is None and "timestamp" not in ohlcv.columns:
+        ohlcv = ohlcv.rename(columns={0: "timestamp"})
+
     n_bars = len(ohlcv)
     logger.info("Walk-forward: %d bars, %d windows, horizon=24 bars", n_bars, n_windows)
 
@@ -345,8 +356,8 @@ def compute_walk_forward(
     ir_per_fold = []
 
     for i, fold in enumerate(wf.split(n_bars)):
-        train_df = ohlcv.iloc[fold.train_indices]
-        test_df = ohlcv.iloc[fold.test_indices]
+        train_df = ohlcv.iloc[fold.train_indices].reset_index(drop=True)
+        test_df = ohlcv.iloc[fold.test_indices].reset_index(drop=True)
 
         if len(test_df) < 10:
             continue

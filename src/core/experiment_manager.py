@@ -59,13 +59,15 @@ logger = logging.getLogger(__name__)
 #  Experiment Spec
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class ExperimentSpec:
     """Defines one experiment to run."""
+
     hypothesis_id: str
     symbol: str = "BTCUSDT"
     timeframe: str = "15m"
-    exchange: str = ""           # Auto-detect if empty
+    exchange: str = ""  # Auto-detect if empty
     stages: List[int] = field(default_factory=lambda: [2, 3, 4, 5, 6])
     # Backtest config overrides
     initial_cash: float = 10_000.0
@@ -77,7 +79,7 @@ class ExperimentSpec:
     min_cross_assets: int = 2
     # Signal source (callable or strategy name)
     signal_fn: Optional[Callable] = None  # Callable[[pd.DataFrame], BacktestSignal]
-    strategy_name: str = ""               # Named strategy from registry
+    strategy_name: str = ""  # Named strategy from registry
     # Metadata
     experiment_id: str = ""
     notes: str = ""
@@ -87,9 +89,11 @@ class ExperimentSpec:
 #  Experiment Result
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class ExperimentResult:
     """Full result of one experiment run."""
+
     experiment_id: str
     hypothesis_id: str
     symbol: str
@@ -170,6 +174,7 @@ class ExperimentResult:
 #  Experiment Manager
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class ExperimentManager:
     """
     Standardized experiment execution engine.
@@ -214,7 +219,9 @@ class ExperimentManager:
         # Generate experiment ID
         if not spec.experiment_id:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            spec.experiment_id = f"{spec.hypothesis_id}_{spec.symbol}_{spec.timeframe}_{ts}"
+            spec.experiment_id = (
+                f"{spec.hypothesis_id}_{spec.symbol}_{spec.timeframe}_{ts}"
+            )
 
         result = ExperimentResult(
             experiment_id=spec.experiment_id,
@@ -253,7 +260,10 @@ class ExperimentManager:
 
         logger.info(
             "Experiment %s: loaded %d bars for %s/%s",
-            spec.experiment_id, len(ohlcv), spec.symbol, spec.timeframe,
+            spec.experiment_id,
+            len(ohlcv),
+            spec.symbol,
+            spec.timeframe,
         )
 
         # ── Step 3: Signal source ──────────────────────────────────────────
@@ -273,9 +283,7 @@ class ExperimentManager:
 
         # ── Step 4: Run backtest ───────────────────────────────────────────
         try:
-            bt_metrics = self._run_backtest(
-                ohlcv, signal_fn, spec, record
-            )
+            bt_metrics = self._run_backtest(ohlcv, signal_fn, spec, record)
             result.profit_factor = bt_metrics.get("profit_factor", 0.0)
             result.sharpe = bt_metrics.get("sharpe", 0.0)
             result.win_rate = bt_metrics.get("win_rate", 0.0)
@@ -294,7 +302,7 @@ class ExperimentManager:
         self._record_metrics(record, bt_metrics)
 
         # ── Step 6: Run pipeline stages ────────────────────────────────────
-        from src.core.research_pipeline import ResearchPipeline, PipelineContext
+        from src.core.research_pipeline import PipelineContext, ResearchPipeline
 
         ctx = PipelineContext(
             min_walk_forward_windows=spec.min_walk_forward_windows,
@@ -322,8 +330,11 @@ class ExperimentManager:
 
         logger.info(
             "Experiment %s COMPLETED: PF=%.2f, stages=%dP/%dF, level=%s",
-            spec.experiment_id, result.profit_factor,
-            result.stages_passed, result.stages_failed, result.final_level,
+            spec.experiment_id,
+            result.profit_factor,
+            result.stages_passed,
+            result.stages_failed,
+            result.final_level,
         )
         return result
 
@@ -338,7 +349,9 @@ class ExperimentManager:
         for i, spec in enumerate(specs):
             logger.info(
                 "Batch experiment %d/%d: %s",
-                i + 1, len(specs), spec.hypothesis_id,
+                i + 1,
+                len(specs),
+                spec.hypothesis_id,
             )
             result = self.run(spec)
             results.append(result)
@@ -364,7 +377,8 @@ class ExperimentManager:
                 timeframe=timeframe,
                 stages=stages or [2, 6],
             )
-            for r in records if not r.archived
+            for r in records
+            if not r.archived
         ]
         return self.run_batch(specs)
 
@@ -383,7 +397,8 @@ class ExperimentManager:
                 timeframe=timeframe,
                 stages=stages or [2, 6],
             )
-            for r in records if not r.archived
+            for r in records
+            if not r.archived
         ]
         return self.run_batch(specs)
 
@@ -404,8 +419,10 @@ class ExperimentManager:
         family = record.family.lower()
 
         if "meanreversion" in family:
-            def mr_signal(window: pd.DataFrame):
+
+            def mr_signal(symbol, window: pd.DataFrame, bar_index: int = 0):
                 from src.backtest.signal_source import BacktestSignal
+
                 if len(window) < 20:
                     return BacktestSignal.flat()
                 close = window["close"]
@@ -419,11 +436,14 @@ class ExperimentManager:
                 elif z > 1.5:
                     return BacktestSignal(direction=-1, proba_alpha=0.70)
                 return BacktestSignal.flat()
+
             return mr_signal
 
         elif "momentum" in family:
-            def mom_signal(window: pd.DataFrame):
+
+            def mom_signal(symbol, window: pd.DataFrame, bar_index: int = 0):
                 from src.backtest.signal_source import BacktestSignal
+
                 if len(window) < 20:
                     return BacktestSignal.flat()
                 close = window["close"]
@@ -433,17 +453,24 @@ class ExperimentManager:
                 if close.iloc[-1] > sma.iloc[-1]:
                     return BacktestSignal(direction=1, proba_alpha=0.65)
                 return BacktestSignal.flat()
+
             return mom_signal
 
         elif "expansion" in family or "volatility" in family:
-            def vol_signal(window: pd.DataFrame):
+
+            def vol_signal(symbol, window: pd.DataFrame, bar_index: int = 0):
                 from src.backtest.signal_source import BacktestSignal
+
                 if len(window) < 20:
                     return BacktestSignal.flat()
                 close = window["close"]
                 atr = (window["high"] - window["low"]).rolling(14).mean()
                 atr_20 = atr.rolling(20).mean()
-                if pd.isna(atr.iloc[-1]) or pd.isna(atr_20.iloc[-1]) or atr_20.iloc[-1] == 0:
+                if (
+                    pd.isna(atr.iloc[-1])
+                    or pd.isna(atr_20.iloc[-1])
+                    or atr_20.iloc[-1] == 0
+                ):
                     return BacktestSignal.flat()
                 # Compression: ATR < 0.7 * 20-period average → expect expansion
                 if atr.iloc[-1] < 0.7 * atr_20.iloc[-1]:
@@ -452,6 +479,7 @@ class ExperimentManager:
                     direction = 1 if mom > 0 else -1
                     return BacktestSignal(direction=direction, proba_alpha=0.60)
                 return BacktestSignal.flat()
+
             return vol_signal
 
         return None
@@ -464,7 +492,7 @@ class ExperimentManager:
         record: HypothesisRecord,
     ) -> Dict[str, Any]:
         """Run the backtest engine and return metrics."""
-        from src.backtest.engine import BacktestEngine, BacktestConfig
+        from src.backtest.engine import BacktestConfig, BacktestEngine
 
         config = BacktestConfig(
             initial_cash=spec.initial_cash,
@@ -556,7 +584,10 @@ class ExperimentManager:
 
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         hypothesis_id = result.hypothesis_id
-        paper_path = papers_dir / f"{date_str}_{hypothesis_id}_{result.symbol}_{result.timeframe}.md"
+        paper_path = (
+            papers_dir
+            / f"{date_str}_{hypothesis_id}_{result.symbol}_{result.timeframe}.md"
+        )
 
         summary = result.summary()
         status_icon = "✓" if result.passed else "✗"
@@ -578,24 +609,24 @@ class ExperimentManager:
 
 - **Symbol**: {result.symbol}
 - **Timeframe**: {result.timeframe}
-- **Bars processed**: {summary.get('bars_processed', 'N/A')}
+- **Bars processed**: {summary.get("bars_processed", "N/A")}
 
 ## Method
 
 - Backtest engine with event-driven simulation
-- Fee: {getattr(self, '_last_spec', None) or '0.1%'}
+- Fee: {getattr(self, "_last_spec", None) or "0.1%"}
 - Stages run: {result.stages_run}
 
 ## Results
 
 | Metric | Value |
 |--------|-------|
-| Profit Factor | {summary['profit_factor']:.3f} |
-| Sharpe | {summary['sharpe']:.3f} |
-| Win Rate | {summary['win_rate']:.1%} |
-| Total Return | {summary['total_return_pct']:.2f}% |
-| Max Drawdown | {summary['max_drawdown_pct']:.2f}% |
-| Closed Trades | {summary['closed_trades']} |
+| Profit Factor | {summary["profit_factor"]:.3f} |
+| Sharpe | {summary["sharpe"]:.3f} |
+| Win Rate | {summary["win_rate"]:.1%} |
+| Total Return | {summary["total_return_pct"]:.2f}% |
+| Max Drawdown | {summary["max_drawdown_pct"]:.2f}% |
+| Closed Trades | {summary["closed_trades"]} |
 
 ## Pipeline Stages
 
@@ -646,7 +677,7 @@ class ExperimentManager:
         content += f"""
 ---
 
-*Auto-generated by ExperimentManager at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*
+*Auto-generated by ExperimentManager at {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}*
 """
 
         with open(paper_path, "w", encoding="utf-8") as f:
