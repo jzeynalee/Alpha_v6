@@ -238,8 +238,8 @@ def run_backtest(
     symbol: str,
     timeframe: str,
     signal_fn=None,
-) -> Dict[str, Any]:
-    """Run backtest and return metrics dict."""
+) -> tuple[Dict[str, Any], pd.DataFrame]:
+    """Run backtest and return metrics dict and ohlcv DataFrame."""
     logger.info("=" * 70)
     logger.info("BACKTEST: %s / %s", symbol, timeframe)
     logger.info("=" * 70)
@@ -281,7 +281,7 @@ def run_backtest(
     logger.info("Max DD:        %.2f%%", config.get("max_drawdown_pct", 0))
     logger.info("Closed Trades: %d", config.get("closed_trades", 0))
 
-    return config
+    return config, ohlcv
 
 
 def compute_trade_returns(
