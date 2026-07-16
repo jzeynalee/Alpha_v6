@@ -124,6 +124,11 @@ _DEFAULT_RISK_CONFIG: Dict = {
     "max_symbol_exposure_pct": 10.0,
     "max_regime_exposure_pct": 10.0,
     "max_leverage":           100.0,
+    # Circuit breaker / drawdown — relaxed for backtesting
+    "portfolio_dd_pct":       0.20,   # was 0.10 (too aggressive)
+    "per_strategy_dd_pct":    0.20,   # was 0.15
+    "circuit_breaker_losses": 10,     # was 5
+    "circuit_breaker_reset_bars": 50,
 }
 
 

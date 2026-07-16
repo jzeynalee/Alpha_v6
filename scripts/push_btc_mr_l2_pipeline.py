@@ -762,7 +762,7 @@ def main():
 
     # Step 2: Run backtest on BTC 15m (primary)
     signal_fn = ExperimentManager._auto_signal_source(record)
-    bt_config_15m = run_backtest("BTCUSDT", "15m", signal_fn)
+    bt_config_15m, ohlcv_15m = run_backtest("BTCUSDT", "15m", signal_fn)
 
     # Step 3: Walk-forward on BTC 15m
     wf_metrics = compute_walk_forward(

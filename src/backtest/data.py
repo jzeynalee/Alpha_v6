@@ -124,7 +124,9 @@ def validate_ohlcv(df: pd.DataFrame, *, symbol: str = "?") -> pd.DataFrame:
     for col in ("open", "high", "low", "close", "volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df[OHLCV_COLUMNS]
+    # Keep core OHLCV columns + any extra columns (e.g. OI, funding)
+    extra_cols = [c for c in df.columns if c not in OHLCV_COLUMNS]
+    df = df[OHLCV_COLUMNS + extra_cols]
 
     if df[["open", "high", "low", "close"]].isna().any().any():
         bad = int(df[["open", "high", "low", "close"]].isna().any(axis=1).sum())
