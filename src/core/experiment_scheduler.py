@@ -28,6 +28,12 @@ Version 4 adds:
     * promotes the corresponding evidence‑ladder hypothesis to L3 if thresholds met.
   This method is called by `scripts/run_research_cycle.py` with the `--promote` flag.
 
+Version 5 adds:
+
+- Multi‑trigger support per mechanism (e.g. M003 bearish / bullish OI divergence).
+- Automatic OI data enrichment for mechanisms that require Open Interest.
+- Trigger variants are registered in `_MECHANISM_TRIGGER_VARIANTS`.
+
 Usage
 -----
     from src.core.experiment_scheduler import ExperimentScheduler
@@ -105,6 +111,24 @@ def _m002_trigger() -> Tuple[str, Callable]:
     return ("roc_5_pos", condition)
 
 _register_trigger("M002", _m002_trigger)
+
+# ── Multi‑trigger variants ──────────────────────────────────────────────────
+# Key: mechanism_id → list of (trigger_name, condition_fn)
+# These will be added as separate queue entries.
+_MECHANISM_TRIGGER_VARIANTS: Dict[str, List[Tuple[str, Callable]]] = {
+    "M003": [
+        (
+            "oi_div_bearish",
+            lambda df: (df["close"] > df["sma20"])
+            & (df["sum_open_interest"] < df["sum_open_interest"].rolling(20).mean()),
+        ),
+        (
+            "oi_div_bullish",
+            lambda df: (df["close"] < df["sma20"])
+            & (df["sum_open_interest"] > df["sum_open_interest"].rolling(20).mean()),
+        ),
+    ],
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -243,6 +267,9 @@ class ExperimentScheduler:
     DEFAULT_NULL_MODEL_TF = "4h"
     DEFAULT_WF_WINDOWS = 6
 
+    # Mechanisms that require OI enrichment
+    OI_REQUIRED_MECHANISMS = {"M003"}
+
     def __init__(
         self,
         ladder: Optional[EvidenceLadder] = None,
@@ -270,7 +297,8 @@ class ExperimentScheduler:
             data = json.loads(self.queue_path.read_text(encoding="utf-8"))
             self._queue = data.get("experiments", [])
             bl = data.get("blacklist", [])
-            self._blacklist = {tuple(x) for x in bl}
+            # blacklist elements: [mid, sym, tf, trigger_name] (trigger_name optional)
+            self._blacklist = {self._normalise_blacklist_key(x) for x in bl}
         except Exception as exc:
             logger.warning("Could not load research queue: %s", exc)
 
@@ -283,28 +311,59 @@ class ExperimentScheduler:
         }
         self.queue_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
+    @staticmethod
+    def _normalise_blacklist_key(raw) -> tuple:
+        """Convert a blacklist entry to (mid, sym, tf, trigger)."""
+        if isinstance(raw, (list, tuple)):
+            parts = list(raw)
+            while len(parts) < 4:
+                parts.append("")
+            return tuple(parts[:4])
+        return (raw, "", "", "")
+
+    def _exp_key(self, exp: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        return (
+            exp["mechanism_id"],
+            exp["symbol"],
+            exp["timeframe"],
+            exp.get("trigger_name", ""),
+        )
+
+    def _is_blacklisted(self, exp: Dict[str, Any]) -> bool:
+        key = self._exp_key(exp)
+        # also check without trigger
+        key_no_trigger = (key[0], key[1], key[2], "")
+        return key in self._blacklist or key_no_trigger in self._blacklist
+
     def generate_candidates(self):
         """Fill the queue with experiments for every mechanism‑symbol‑timeframe combination."""
+        # Built‑in mechanisms (M001, M002, M004, M005)
         for mid, mech in self.registry._mechanisms.items():
-            if mid.startswith("_"):
+            if mid.startswith("_") or mid in _MECHANISM_TRIGGER_VARIANTS:
                 continue
             symbols = self.DEFAULT_SYMBOLS
             timeframes = self.DEFAULT_TIMEFRAMES
 
             for sym in symbols:
                 for tf in timeframes:
-                    if (mid, sym, tf) in self._blacklist:
+                    exp = {
+                        "mechanism_id": mid,
+                        "symbol": sym,
+                        "timeframe": tf,
+                        "trigger_name": "",
+                    }
+                    if self._is_blacklisted(exp):
                         continue
                     existing = next(
                         (e for e in self._queue
-                         if e["mechanism_id"] == mid and e["symbol"] == sym and e["timeframe"] == tf),
+                         if e["mechanism_id"] == mid and e["symbol"] == sym and e["timeframe"] == tf
+                         and e.get("trigger_name", "") == ""),
                         None,
                     )
                     if existing and existing.get("status") in ("completed", "rejected"):
                         continue
 
                     cost_estimate = 1.0
-                    # Retrieve belief for this combination
                     belief = self._beliefs.get((mid, sym, tf))
                     prob = belief.prob_effect_gt(self.MIN_EFFECT_THRESHOLD_BP) if belief else None
                     priority = default_priority(
@@ -318,6 +377,7 @@ class ExperimentScheduler:
                         "mechanism_id": mid,
                         "symbol": sym,
                         "timeframe": tf,
+                        "trigger_name": "",
                         "status": "pending",
                         "priority": round(priority, 6),
                         "last_run": None,
@@ -327,6 +387,56 @@ class ExperimentScheduler:
                         existing.update(entry)
                     else:
                         self._queue.append(entry)
+
+        # Multi‑trigger variants (M003 bearish/bullish)
+        for mid, variants in _MECHANISM_TRIGGER_VARIANTS.items():
+            symbols = self.DEFAULT_SYMBOLS
+            timeframes = self.DEFAULT_TIMEFRAMES
+            for sym in symbols:
+                for tf in timeframes:
+                    for tname, _cond in variants:
+                        exp = {
+                            "mechanism_id": mid,
+                            "symbol": sym,
+                            "timeframe": tf,
+                            "trigger_name": tname,
+                        }
+                        if self._is_blacklisted(exp):
+                            continue
+                        existing = next(
+                            (e for e in self._queue
+                             if e["mechanism_id"] == mid and e["symbol"] == sym
+                             and e["timeframe"] == tf and e.get("trigger_name", "") == tname),
+                            None,
+                        )
+                        if existing and existing.get("status") in ("completed", "rejected"):
+                            continue
+
+                        mech = self.registry.get(mid)
+                        cost_estimate = 1.0
+                        belief = self._beliefs.get((mid, sym, tf))
+                        prob = belief.prob_effect_gt(self.MIN_EFFECT_THRESHOLD_BP) if belief else None
+                        priority = default_priority(
+                            mech,
+                            n_assets=len(symbols),
+                            n_regimes=3,
+                            cost_estimate=cost_estimate,
+                            belief_prob=prob,
+                        )
+                        entry = {
+                            "mechanism_id": mid,
+                            "symbol": sym,
+                            "timeframe": tf,
+                            "trigger_name": tname,
+                            "status": "pending",
+                            "priority": round(priority, 6),
+                            "last_run": None,
+                            "result_summary": None,
+                        }
+                        if existing:
+                            existing.update(entry)
+                        else:
+                            self._queue.append(entry)
 
         self._save_queue()
 
@@ -364,6 +474,20 @@ class ExperimentScheduler:
             mid, sym, tf, mean_bp, var_bp, n, belief.prob_effect_gt(self.MIN_EFFECT_THRESHOLD_BP),
         )
 
+    # ── OI enrichment ───────────────────────────────────────────────────────
+
+    def _enrich_oi(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """Add Open Interest columns for mechanisms that require them."""
+        try:
+            from src.features.positioning_enricher import enrich_ohlcv, clear_cache
+            clear_cache()
+            df = enrich_ohlcv(df, symbol)
+            logger.info("OI enrichment succeeded for %s (%d rows)", symbol, len(df))
+            return df
+        except Exception as exc:
+            logger.warning("OI enrichment failed for %s: %s", symbol, exc)
+            return df  # proceed without enrichment; triggers will likely fail gracefully
+
     # ── Prioritisation ──────────────────────────────────────────────────────
 
     def schedule(
@@ -375,7 +499,7 @@ class ExperimentScheduler:
         pending = [
             e for e in self._queue
             if e.get("status") == "pending"
-            and (e["mechanism_id"], e["symbol"], e["timeframe"]) not in self._blacklist
+            and not self._is_blacklisted(e)
         ]
         if priority_fn is not None:
             for e in pending:
@@ -417,8 +541,9 @@ class ExperimentScheduler:
         mid = exp["mechanism_id"]
         symbol = exp["symbol"]
         timeframe = exp["timeframe"]
+        trigger_name = exp.get("trigger_name", "")
 
-        logger.info("Running experiment: %s on %s/%s", mid, symbol, timeframe)
+        logger.info("Running experiment: %s on %s/%s (%s)", mid, symbol, timeframe, trigger_name or "default")
         exp["last_run"] = datetime.now(timezone.utc).isoformat()
 
         mech = self.registry.get(mid)
@@ -427,18 +552,39 @@ class ExperimentScheduler:
             exp["result_summary"] = "Unknown mechanism"
             return exp
 
-        trigger_info = trigger_for_mechanism(mech, symbol, timeframe)
-        if trigger_info is None:
-            exp["status"] = "skipped"
-            exp["result_summary"] = "No trigger mapping available"
-            return exp
-        trig_name, condition_fn = trigger_info
+        # Resolve trigger callable
+        if trigger_name:
+            variants = _MECHANISM_TRIGGER_VARIANTS.get(mid, [])
+            cond_fn = None
+            for tname, fn in variants:
+                if tname == trigger_name:
+                    cond_fn = fn
+                    break
+            if cond_fn is None:
+                exp["status"] = "skipped"
+                exp["result_summary"] = f"No trigger variant '{trigger_name}' for {mid}"
+                return exp
+            trig_name_display = trigger_name
+        else:
+            trigger_info = trigger_for_mechanism(mech, symbol, timeframe)
+            if trigger_info is None:
+                exp["status"] = "skipped"
+                exp["result_summary"] = "No trigger mapping available"
+                return exp
+            trig_name_display, cond_fn = trigger_info
 
+        # Prepare data
         try:
             study = EventStudy(symbol, timeframe, max_bars=50000)
-            study.add_trigger(trig_name, condition_fn)
             df = study.load_data()
             df = study.compute_features(df)
+
+            # Enrich with OI if needed
+            if mid in self.OI_REQUIRED_MECHANISMS:
+                df = self._enrich_oi(df, symbol)
+                df = study.compute_features(df)  # re‑compute after enrichment
+
+            study.add_trigger(trig_name_display, cond_fn)
             results = study.run(df=df)
         except Exception as exc:
             logger.error("Experiment failed: %s", exc)
@@ -479,7 +625,7 @@ class ExperimentScheduler:
                 eff_var_bp = float(np.var(raw) * 1e8)  # log-return variance → bp²
 
         summary = {
-            "trigger": trig_name,
+            "trigger": trig_name_display,
             "n_events": n_events,
             "significant_horizons": best.significant_horizons,
             "best_horizon": best_h if best.significant_horizons else None,
@@ -496,21 +642,23 @@ class ExperimentScheduler:
             if p_val > 0.2 and abs(mean_bp) < 5.0 and n_events > 10:
                 reject = True
         if reject:
-            self._blacklist.add((mid, symbol, timeframe))
+            # blacklist the specific combination
+            self._blacklist.add(self._exp_key(exp))
             exp["status"] = "rejected"
             exp["result_summary"] = summary
-            logger.info("Experiment %s/%s/%s rejected (stopping rule)", mid, symbol, timeframe)
+            logger.info("Experiment %s/%s/%s [%s] rejected (stopping rule)", mid, symbol, timeframe, trigger_name)
         else:
             exp["status"] = "completed"
             exp["result_summary"] = summary
 
         # ── Update mechanism effect summary ─────────────────────────────────
-        effect_key = f"{symbol}_{timeframe}"
+        effect_key = f"{symbol}_{timeframe}_{trigger_name}".rstrip("_")
         if effect_key not in mech.effect_summary:
             mech.effect_summary[effect_key] = {}
         mech.effect_summary[effect_key].update({
             "symbol": symbol,
             "timeframe": timeframe,
+            "trigger": trig_name_display,
             "horizon": best_h,
             "mean_bp": round(mean_bp, 2),
             "ci_low_bp": round(ci_low_bp, 2),
@@ -524,12 +672,12 @@ class ExperimentScheduler:
         self._update_belief(mid, symbol, timeframe, mean_bp, eff_var_bp, n_events)
 
         # ── Update evidence ladder ──────────────────────────────────────────
-        hypo_id = f"{mid}_{symbol}_{timeframe}"
+        hypo_id = f"{mid}_{symbol}_{timeframe}_{trigger_name}".rstrip("_")
         record = self.ladder.get(hypo_id)
         if record is None:
             record = HypothesisRecord(
                 hypothesis_id=hypo_id,
-                name=f"{mech.name} on {symbol}/{timeframe}",
+                name=f"{mech.name} on {symbol}/{timeframe} ({trig_name_display})",
                 family="MechanismValidation",
                 description=f"Automated event study for {mid}",
                 economic_rationale=mech.economic_rationale,
@@ -552,7 +700,9 @@ class ExperimentScheduler:
             record.demote("Event study no significant horizon", 2)
 
         # ── Autonomous replication ──────────────────────────────────────────
-        self._schedule_replications(exp, p_val, mean_bp)
+        # For multi‑trigger variants, only schedule replications for the same variant
+        if best.significant_horizons:
+            self._schedule_replications(exp, p_val, mean_bp)
 
         return exp
 
@@ -566,37 +716,41 @@ class ExperimentScheduler:
         mid = original["mechanism_id"]
         sym = original["symbol"]
         tf = original["timeframe"]
+        trigger_name = original.get("trigger_name", "")
         if mean_bp < self.MIN_EFFECT_THRESHOLD_BP:
             return
 
         logger.info(
-            "Significant result found for %s|%s|%s — scheduling replications.",
-            mid, sym, tf,
+            "Significant result found for %s|%s|%s [%s] — scheduling replications.",
+            mid, sym, tf, trigger_name,
         )
 
         # 1. Same timeframe, other symbols
         for other_sym in self.DEFAULT_SYMBOLS:
             if other_sym == sym:
                 continue
-            self._ensure_experiment(mid, other_sym, tf, parent_id=f"{mid}_{sym}_{tf}")
+            self._ensure_experiment(mid, other_sym, tf, parent_id=f"{mid}_{sym}_{tf}", trigger_name=trigger_name)
 
         # 2. Other timeframes for the same symbol (optional — to map D019 scaling)
         for other_tf in self.REPLICATION_TIMEFRAMES:
             if other_tf == tf:
                 continue
-            self._ensure_experiment(mid, sym, other_tf, parent_id=f"{mid}_{sym}_{tf}")
+            self._ensure_experiment(mid, sym, other_tf, parent_id=f"{mid}_{sym}_{tf}", trigger_name=trigger_name)
 
         self._save_queue()
 
-    def _ensure_experiment(self, mechanism_id: str, symbol: str, timeframe: str, parent_id: str):
+    def _ensure_experiment(self, mechanism_id: str, symbol: str, timeframe: str, parent_id: str,
+                           trigger_name: str = ""):
         """Add a pending experiment for the given combination unless already present or blacklisted."""
-        if (mechanism_id, symbol, timeframe) in self._blacklist:
+        key = (mechanism_id, symbol, timeframe, trigger_name)
+        if key in self._blacklist:
             return
         existing = next(
             (e for e in self._queue
              if e["mechanism_id"] == mechanism_id
              and e["symbol"] == symbol
-             and e["timeframe"] == timeframe),
+             and e["timeframe"] == timeframe
+             and e.get("trigger_name", "") == trigger_name),
             None,
         )
         if existing and existing.get("status") in ("completed", "rejected", "pending"):
@@ -617,6 +771,7 @@ class ExperimentScheduler:
             "mechanism_id": mechanism_id,
             "symbol": symbol,
             "timeframe": timeframe,
+            "trigger_name": trigger_name,
             "status": "pending",
             "priority": round(priority, 6),
             "last_run": None,
@@ -625,8 +780,8 @@ class ExperimentScheduler:
         }
         self._queue.append(entry)
         logger.info(
-            "Replication enqueued: %s|%s|%s (parent %s)",
-            mechanism_id, symbol, timeframe, parent_id,
+            "Replication enqueued: %s|%s|%s [%s] (parent %s)",
+            mechanism_id, symbol, timeframe, trigger_name, parent_id,
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
