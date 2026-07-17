@@ -1,21 +1,21 @@
 """
 Experiment Scheduler — Generic, budget-aware discovery loop with Bayesian
-belief tracking and exploration/exploitation.
+belief tracking, exploration/exploitation, and autonomous replication.
 
 Automates the cycle:
-    queue → prioritise → execute → update evidence → repeat
+    queue → prioritise → execute → update evidence → replicate → repeat
 
 Pluggable priority policies, stopping rules, and mechanism-specific
 trigger factories live here (or in companion modules). The scheduler
 itself does **not** contain any research logic — it only orchestrates
 existing components (EventStudy, MechanismRegistry, EvidenceLadder).
 
-Version 2 adds:
+Version 3 adds:
 
-- Per-combination **BeliefState** (Bayesian update of effect size).
-- Storage of 95% confidence intervals, standard deviation, and sample size.
-- 20% exploration rate to avoid missing promising areas.
-- Priority computation that uses posterior probability where available.
+- Automatic replication: when a significant result is found, the scheduler
+  immediately enqueues confirmation experiments on other assets for the same
+  mechanism and timeframe. Promotion decisions are deferred until a minimum
+  number of replications have been completed.
 
 Usage
 -----
@@ -199,7 +199,8 @@ def default_priority(
 
 class ExperimentScheduler:
     """
-    Generic experiment scheduler with Bayesian belief tracking.
+    Generic experiment scheduler with Bayesian belief tracking and
+    autonomous replication.
 
     Responsibilities
     ----------------
@@ -209,12 +210,16 @@ class ExperimentScheduler:
     - Update the mechanism registry and evidence ladder with results.
     - Apply stopping rules and exploration/exploitation.
     - Maintain a per‑combination belief state for Bayesian evidence accumulation.
+    - Automatically schedule replication experiments for significant results.
     """
 
     DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
     DEFAULT_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
-    EXPLORATION_RATE = 0.2   # 20% of batches go to random exploration
-    MIN_EFFECT_THRESHOLD_BP = 5.0  # minimum effect to consider actionable
+    EXPLORATION_RATE = 0.2
+    MIN_EFFECT_THRESHOLD_BP = 5.0
+    MIN_REPLICATIONS_REQUIRED = 3       # number of cross‑asset replications needed
+    SIGNIFICANCE_THRESHOLD = 0.05        # p‑value threshold to trigger replication
+    REPLICATION_TIMEFRAMES = ["1h", "4h", "1d"]  # timeframes to attempt replication
 
     def __init__(
         self,
@@ -524,7 +529,83 @@ class ExperimentScheduler:
         else:
             record.demote("Event study no significant horizon", 2)
 
+        # ── Autonomous replication ──────────────────────────────────────────
+        self._schedule_replications(exp, p_val, mean_bp)
+
         return exp
+
+    # ── Replication scheduling ──────────────────────────────────────────────
+
+    def _schedule_replications(self, original: Dict[str, Any], p_val: float, mean_bp: float):
+        """If the original experiment was significant, enqueue replications on other assets
+        at the same timeframe and, optionally, at other timeframes."""
+        if p_val >= self.SIGNIFICANCE_THRESHOLD:
+            return
+        mid = original["mechanism_id"]
+        sym = original["symbol"]
+        tf = original["timeframe"]
+        if mean_bp < self.MIN_EFFECT_THRESHOLD_BP:
+            return
+
+        logger.info(
+            "Significant result found for %s|%s|%s — scheduling replications.",
+            mid, sym, tf,
+        )
+
+        # 1. Same timeframe, other symbols
+        for other_sym in self.DEFAULT_SYMBOLS:
+            if other_sym == sym:
+                continue
+            self._ensure_experiment(mid, other_sym, tf, parent_id=f"{mid}_{sym}_{tf}")
+
+        # 2. Other timeframes for the same symbol (optional — to map D019 scaling)
+        for other_tf in self.REPLICATION_TIMEFRAMES:
+            if other_tf == tf:
+                continue
+            self._ensure_experiment(mid, sym, other_tf, parent_id=f"{mid}_{sym}_{tf}")
+
+        self._save_queue()
+
+    def _ensure_experiment(self, mechanism_id: str, symbol: str, timeframe: str, parent_id: str):
+        """Add a pending experiment for the given combination unless already present or blacklisted."""
+        if (mechanism_id, symbol, timeframe) in self._blacklist:
+            return
+        existing = next(
+            (e for e in self._queue
+             if e["mechanism_id"] == mechanism_id
+             and e["symbol"] == symbol
+             and e["timeframe"] == timeframe),
+            None,
+        )
+        if existing and existing.get("status") in ("completed", "rejected", "pending"):
+            return
+
+        mech = self.registry.get(mechanism_id)
+        cost_estimate = 1.0
+        belief = self._beliefs.get((mechanism_id, symbol, timeframe))
+        prob = belief.prob_effect_gt(self.MIN_EFFECT_THRESHOLD_BP) if belief else None
+        priority = default_priority(
+            mech,
+            n_assets=len(self.DEFAULT_SYMBOLS),
+            n_regimes=3,
+            cost_estimate=cost_estimate,
+            belief_prob=prob,
+        )
+        entry = {
+            "mechanism_id": mechanism_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "status": "pending",
+            "priority": round(priority, 6),
+            "last_run": None,
+            "result_summary": None,
+            "replication_of": parent_id,
+        }
+        self._queue.append(entry)
+        logger.info(
+            "Replication enqueued: %s|%s|%s (parent %s)",
+            mechanism_id, symbol, timeframe, parent_id,
+        )
 
 
 # ── Quick entry point ────────────────────────────────────────────────────────
