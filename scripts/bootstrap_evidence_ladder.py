@@ -22,6 +22,11 @@ specific research topics listed in the roadmap.
 
 Current validated alpha families are annotated with their current status.
 
+Additionally, the validated mechanisms (M001-M005) and the negative
+knowledge entries (NEG001-NEG016) from DISCOVERIES.md are seeded with
+their current evidence levels, ensuring the ladder mirrors the full
+research state.
+
 Usage
 -----
     python scripts/bootstrap_evidence_ladder.py
@@ -40,6 +45,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.core.evidence_ladder import EvidenceLadder, EvidenceLevel, HypothesisRecord
 
 
+# ----------------------------------------------------------------------
+# Helper: register a hypothesis at a specific evidence level
+# ----------------------------------------------------------------------
+def _register(ladder: EvidenceLadder, **kwargs) -> None:
+    """Create and register a HypothesisRecord, optionally archived."""
+    record = HypothesisRecord(
+        hypothesis_id=kwargs["id"],
+        name=kwargs["name"],
+        family=kwargs.get("family", ""),
+        description=kwargs.get("description", ""),
+        economic_rationale=kwargs.get("rationale", ""),
+        evidence_level=kwargs.get("evidence_level", EvidenceLevel.L0),
+        symbols=kwargs.get("symbols", []),
+        timeframes=kwargs.get("timeframes", []),
+        tags=kwargs.get("tags", []),
+        archived=kwargs.get("archived", False),
+    )
+    ladder.register(record)
+
+
+# ----------------------------------------------------------------------
+# Priority seeders (unchanged logic)
+# ----------------------------------------------------------------------
 def seed_priority_1_positioning(ladder: EvidenceLadder) -> None:
     """Priority 1: Open Interest + Funding + Positioning ★★★★★"""
     topics = [
@@ -550,6 +578,9 @@ def seed_priority_12_indicators(ladder: EvidenceLadder) -> None:
         ladder.register(record)
 
 
+# ----------------------------------------------------------------------
+# Existing alphas (unchanged)
+# ----------------------------------------------------------------------
 def seed_existing_alphas(ladder: EvidenceLadder) -> None:
     """Seed existing alpha families with current status (renamed per Research Platform v2).
 
@@ -659,6 +690,184 @@ def seed_existing_alphas(ladder: EvidenceLadder) -> None:
         ladder.register(record)
 
 
+# ----------------------------------------------------------------------
+# Validated mechanisms (M001-M005)
+# ----------------------------------------------------------------------
+def seed_validated_mechanisms(ladder: EvidenceLadder) -> None:
+    """Seed the five validated/rejected mechanisms with current evidence levels."""
+    mechanisms = [
+        {
+            "id": "M001",
+            "name": "Liquidity Exhaustion (Z-score MR)",
+            "family": "MeanReversionAlpha",
+            "description": "Z-score overbought predicts reversal. "
+            "Effect strongest at 4h (+61bp) and 1d (+427bp). Asymmetric: only tops predict reversal.",
+            "rationale": "Liquidity exhaustion at extreme Z-scores; overleveraged longs unwind.",
+            "evidence_level": EvidenceLevel.L4,
+            "symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
+            "timeframes": ["4h", "1d"],
+            "tags": ["mechanism", "validated", "M001", "zscore", "mean_reversion"],
+        },
+        {
+            "id": "M002",
+            "name": "Trend Continuation (ROC Momentum)",
+            "family": "MomentumAlpha",
+            "description": "ROC(5)>0.5% predicts continuation at 4h (+55bp). "
+            "Commoditized factor — fails null model (naive SMA20 beats it).",
+            "rationale": "Momentum persists due to slow information diffusion.",
+            "evidence_level": EvidenceLevel.L3,  # robust but needs reconstruction
+            "symbols": ["ETHUSDT", "SOLUSDT", "BTCUSDT"],
+            "timeframes": ["4h"],
+            "tags": ["mechanism", "validated", "M002", "momentum", "needs_reconstruction"],
+        },
+        {
+            "id": "M003",
+            "name": "Position Unwind (OI Divergence)",
+            "family": "PositioningAlpha",
+            "description": "OI divergence reversal. "
+            "Rejected — no significant predictive power found in event study.",
+            "rationale": "Price rising while OI falling suggests weakening trend.",
+            "evidence_level": EvidenceLevel.L0,
+            "archived": True,
+            "symbols": ["BTCUSDT"],
+            "timeframes": ["15m"],
+            "tags": ["mechanism", "rejected", "M003", "oi_divergence"],
+        },
+        {
+            "id": "M004",
+            "name": "Funding Rotation",
+            "family": "PositioningAlpha",
+            "description": "Funding rate extremes predict reversal on BTC "
+            "(+33bp 4h, +85bp 1d). Not significant on ETH.",
+            "rationale": "Deep BTC perpetual market creates arbitrage pressure.",
+            "evidence_level": EvidenceLevel.L1,
+            "symbols": ["BTCUSDT"],
+            "timeframes": ["4h", "1d"],
+            "tags": ["mechanism", "observed", "M004", "funding"],
+        },
+        {
+            "id": "M005",
+            "name": "Vol Compression",
+            "family": "ExpansionAlpha",
+            "description": "Low volatility periods predict expansion. "
+            "Weak effect on BTC, stronger on SOL. Needs replication.",
+            "rationale": "Volatility clustering and mean-reversion.",
+            "evidence_level": EvidenceLevel.L1,
+            "symbols": ["BTCUSDT", "SOLUSDT"],
+            "timeframes": ["15m", "4h"],
+            "tags": ["mechanism", "observed", "M005", "volatility", "compression"],
+        },
+    ]
+
+    for m in mechanisms:
+        level = m.pop("evidence_level", EvidenceLevel.L0)
+        archived = m.pop("archived", False)
+        record = HypothesisRecord(
+            hypothesis_id=m["id"],
+            name=m["name"],
+            family=m["family"],
+            description=m["description"],
+            economic_rationale=m["rationale"],
+            evidence_level=level,
+            symbols=m["symbols"],
+            timeframes=m["timeframes"],
+            tags=m["tags"],
+            archived=archived,
+        )
+        ladder.register(record)
+
+
+# ----------------------------------------------------------------------
+# Negative knowledge entries (NEG001-NEG016)
+# ----------------------------------------------------------------------
+def seed_negative_knowledge(ladder: EvidenceLadder) -> None:
+    """Seed the 16 negative‑knowledge entries from DISCOVERIES.md as archived hypotheses."""
+    entries = [
+        ("NEG001", "Funding rate alone predicts reversals",
+         "PositioningAlpha",
+         "Rejected — walk‑forward PF=0.81, timing unreliable.",
+         "Do not retry unless combined with OI divergence or price confirmation."),
+        ("NEG002", "BTC Mean‑Reversion without regime filter",
+         "MeanReversionAlpha",
+         "Rejected — walk‑forward PF=0.90‑1.10, edge exists only in range‑bound conditions.",
+         "Do not retry unless MTF regime gate added."),
+        ("NEG003", "Fixed percentage thresholds for mean‑reversion",
+         "IndicatorAlpha",
+         "Rejected — PF=1.08 vs z‑score PF=1.35.",
+         "Do not retry unless thresholds are regime‑adaptive."),
+        ("NEG004", "YTC Continuation on BTC 5m",
+         "ContinuationAlpha",
+         "Archived — no persistent edge.",
+         "Do not retry unless new structural market change."),
+        ("NEG005", "Fibonacci‑based continuation patterns",
+         "IndicatorAlpha",
+         "Archived — no economic mechanism.",
+         "Do not retry unless testable economic theory proposed."),
+        ("NEG006", "VSA Capitulation patterns",
+         "IndicatorAlpha",
+         "Archived — not predictive after costs.",
+         "Do not retry unless combined with order flow confirmation."),
+        ("NEG007", "ETH Momentum without multi‑factor confirmation",
+         "MomentumAlpha",
+         "Rejected — simple SMA20 produced PF=0.000.",
+         "Do not retry unless multi‑factor confirmation used."),
+        ("NEG008", "Bollinger Squeeze + entropy filter as standalone signal",
+         "ExpansionAlpha",
+         "Rejected — PF=0.072, poor directional discrimination.",
+         "Do not retry unless combined with HTF context or order flow bias."),
+        ("NEG009", "Funding rate z‑score as standalone signal",
+         "PositioningAlpha",
+         "Rejected — PF=0.30, 8% win rate.",
+         "Do not retry unless combined with OI extremes or price confirmation."),
+        ("NEG010", "BTC Mean‑Reversion with ADX filter on 15m",
+         "MeanReversionAlpha",
+         "Rejected — PF=0.428, edge vanished.",
+         "Do not retry unless new entry mechanism or tested on 4h+."),
+        ("NEG011", "Equal‑weight ensemble without regime awareness",
+         "EnsembleAlpha",
+         "Rejected — PF=0.57, dilution of strong signals.",
+         "Do not retry unless dynamic Sharpe‑weighted or regime‑adaptive allocation used."),
+        ("NEG012", "OI divergence as standalone reversal predictor",
+         "PositioningAlpha",
+         "Rejected — event study found zero significant predictive power.",
+         "Do not retry unless combined with second confirmation mechanism."),
+        ("NEG013", "Momentum continuation on 1h timeframe",
+         "MomentumAlpha",
+         "Rejected — no component reached significance; mechanism only works at 4h+.",
+         "Do not retry unless tested on 4h+."),
+        ("NEG014", "OI divergence on 15m timeframe",
+         "PositioningAlpha",
+         "Rejected — see NEG012; 4h OI data needed.",
+         "Do not retry unless OI resampled to 4h with proper aggregation."),
+        ("NEG015", "Short‑term (15m/1h) mechanism testing as definitive rejection",
+         "Methodology",
+         "Rejected — D019 proves mechanisms invisible at 15m can be significant at 4h/1d.",
+         "Do not retry — process change."),
+        ("NEG016", "ROC(5) momentum on 4h as unique alpha",
+         "MomentumAlpha",
+         "Rejected — commoditized factor, fails null model comparison.",
+         "Do not retry unless reconstructed with cross‑sectional ranking or regime‑conditional triggers."),
+    ]
+
+    for hid, name, family, desc, rationale in entries:
+        record = HypothesisRecord(
+            hypothesis_id=hid,
+            name=name,
+            family=family,
+            description=desc,
+            economic_rationale=rationale,
+            evidence_level=EvidenceLevel.L0,
+            symbols=["BTCUSDT", "ETHUSDT"],
+            timeframes=["15m", "1h"],
+            tags=["negative_knowledge", "archived", hid],
+            archived=True,
+        )
+        ladder.register(record)
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Bootstrap the Evidence Ladder with roadmap alpha families."
@@ -691,6 +900,8 @@ def main() -> None:
     seed_priority_11_portfolio(ladder)
     seed_priority_12_indicators(ladder)
     seed_existing_alphas(ladder)
+    seed_validated_mechanisms(ladder)
+    seed_negative_knowledge(ladder)
 
     print(ladder.render_summary())
 
