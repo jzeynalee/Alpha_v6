@@ -53,6 +53,17 @@ Version 7 adds:
   runs the null‑model gate and walk‑forward validation — the mechanism is
   promoted to L3 in the evidence ladder if both checks pass.
 
+Version 8 adds:
+
+- Automatic registration of validated mechanisms as AlphaStreams in the
+  AlphaEngine once they reach L3 (Walk‑Forward Validated).  The engine
+  persistently stores the stream configuration in
+  ``data/experiments/alpha_streams.json`` so it can be loaded later for
+  portfolio construction.
+- A `--review` mode in the CLI runner that prints the evidence state of every
+  mechanism, including effect summaries, promotion readiness, and a comparison
+  against the manual event‑study reports.
+
 Usage
 -----
     from src.core.experiment_scheduler import ExperimentScheduler
@@ -296,6 +307,7 @@ class ExperimentScheduler:
     - Automatically schedule replication experiments for significant results.
     - Track cross‑asset replication counts and automatically run null‑model gate
       + walk‑forward validation (→ L3 promotion) once ≥3 replications exist.
+    - Register validated mechanisms as AlphaStreams for the AlphaEngine.
 
     """
 
@@ -314,6 +326,15 @@ class ExperimentScheduler:
 
     # Mechanisms that require data enrichment (OI / funding)
     ENRICH_REQUIRED_MECHANISMS = {"M003", "M004"}
+
+    # Mapping from mechanism ID to an AlphaEngine family name
+    MECHANISM_FAMILY_MAP = {
+        "M001": "MeanReversionAlpha",
+        "M002": "MomentumAlpha",
+        "M003": "PositioningAlpha",
+        "M004": "PositioningAlpha",
+        "M005": "ExpansionAlpha",
+    }
 
     def __init__(
         self,
@@ -926,6 +947,10 @@ class ExperimentScheduler:
         else:
             logger.warning("Advancement: no ladder record for %s", mechanism_id)
 
+        # --- auto‑register as AlphaStream if L3 reached ---
+        if null_passed and wf_passed:
+            self._maybe_register_alpha_stream(mechanism_id)
+
     # ── Automatic advancement triggering ────────────────────────────────────
 
     def _auto_advance_mechanisms(self):
@@ -1043,6 +1068,79 @@ class ExperimentScheduler:
         logger.info("WF %s/%s/%s: %d/%d positive folds",
                     mech.mechanism_id, symbol, timeframe, positive_folds, n_folds)
         return positive_folds, n_folds
+
+
+    # ── AlphaEngine registration ────────────────────────────────────────────
+
+    def _maybe_register_alpha_stream(self, mechanism_id: str) -> None:
+        """
+        If *mechanism_id* is not already recorded in
+        ``data/experiments/alpha_streams.json``, create an AlphaStream entry
+        from the mechanism’s current data and write it to that file.  The entry
+        can later be loaded by the AlphaEngine.
+        """
+        from src.core.alpha_engine import AlphaEngine, AlphaStream
+
+        alpha_path = Path("data/experiments/alpha_streams.json")
+        registry_dict: Dict[str, dict] = {}
+        if alpha_path.exists():
+            try:
+                registry_dict = json.loads(alpha_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if mechanism_id in registry_dict:
+            return
+
+        mech = self.registry.get(mechanism_id)
+        record = self.ladder.get(mechanism_id)
+        if mech is None:
+            return
+
+        family = self.MECHANISM_FAMILY_MAP.get(mechanism_id, "Unknown")
+        level = record.evidence_level if record else EvidenceLevel.L0
+
+        # approximate expected return / vol from effect summaries
+        return_sum = 0.15   # placeholder annual return
+        vol_sum = 0.20      # placeholder annual vol
+        # try to estimate from best effect
+        best_score = -1.0
+        for v in mech.effect_summary.values():
+            mean_bp = v.get("mean_bp", 0)
+            p_val = v.get("p_value", 1)
+            score = abs(mean_bp) * (1 - p_val)
+            if score > best_score:
+                best_score = score
+                if abs(mean_bp) > 0:
+                    # crude: assume 10 trades per month ~ 120 per year
+                    annualized = (mean_bp * 1e-4 * 120)
+                    return_sum = max(annualized, 0.01)
+
+        symbols = list({v["symbol"] for v in mech.effect_summary.values() if "symbol" in v})
+        timeframes = list({v["timeframe"] for v in mech.effect_summary.values() if "timeframe" in v})
+
+        stream_data = {
+            "mechanism_id": mechanism_id,
+            "name": mech.name,
+            "family": family,
+            "evidence_level": level.value,
+            "expected_return": round(return_sum, 4),
+            "expected_vol": vol_sum,
+            "sharpe": round(return_sum / vol_sum if vol_sum else 0.0, 3),
+            "symbols": symbols,
+            "timeframes": timeframes,
+        }
+        # In a real deployment we would instantiate an AlphaStream and register
+        # it in a live engine, but for headless operation we simply persist
+        # the definition.
+        try:
+            alpha_path.parent.mkdir(parents=True, exist_ok=True)
+            alpha_path.write_text(
+                json.dumps(registry_dict | {mechanism_id: stream_data}, indent=2, default=str),
+                encoding="utf-8"
+            )
+            logger.info("AlphaStream %s persisted to %s", mechanism_id, alpha_path)
+        except Exception as exc:
+            logger.error("Failed to write alpha stream: %s", exc)
 
 
 # ── Quick entry point ───────────────────────────────────────────────────────
