@@ -1,5 +1,6 @@
 """
-Experiment Scheduler — Generic, budget-aware discovery loop.
+Experiment Scheduler — Generic, budget-aware discovery loop with Bayesian
+belief tracking and exploration/exploitation.
 
 Automates the cycle:
     queue → prioritise → execute → update evidence → repeat
@@ -9,12 +10,19 @@ trigger factories live here (or in companion modules). The scheduler
 itself does **not** contain any research logic — it only orchestrates
 existing components (EventStudy, MechanismRegistry, EvidenceLadder).
 
+Version 2 adds:
+
+- Per-combination **BeliefState** (Bayesian update of effect size).
+- Storage of 95% confidence intervals, standard deviation, and sample size.
+- 20% exploration rate to avoid missing promising areas.
+- Priority computation that uses posterior probability where available.
+
 Usage
 -----
     from src.core.experiment_scheduler import ExperimentScheduler
 
     scheduler = ExperimentScheduler()
-    scheduler.run_cycle(budget=3)  # run 3 highest-priority experiments
+    scheduler.run_cycle(budget=3)
 """
 
 from __future__ import annotations
@@ -22,7 +30,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-import time as _time
+import random
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -30,8 +39,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from src.core.evidence_ladder import EvidenceLadder, EvidenceLevel, HypothesisRecord, StageResult
-from src.core.mechanism_registry import Mechanism, MechanismRegistry, registry as _registry
+from src.core.evidence_ladder import (
+    EvidenceLadder, EvidenceLevel, HypothesisRecord, StageResult
+)
+from src.core.mechanism_registry import (
+    Mechanism, MechanismRegistry, registry as _registry
+)
 from src.validation.event_study import EventStudy, EventStudyResult
 
 logger = logging.getLogger(__name__)
@@ -49,7 +62,9 @@ def _register_trigger(mech_id: str, builder: Callable):
     _TRIGGER_BUILDERS[mech_id] = builder
 
 
-def trigger_for_mechanism(mechanism: Mechanism, symbol: str, timeframe: str) -> Optional[Tuple[str, Callable]]:
+def trigger_for_mechanism(
+    mechanism: Mechanism, symbol: str, timeframe: str
+) -> Optional[Tuple[str, Callable]]:
     """Return (trigger_name, condition_fn) for the given mechanism, or None."""
     build = _TRIGGER_BUILDERS.get(mechanism.mechanism_id)
     if build is None:
@@ -61,17 +76,13 @@ def trigger_for_mechanism(mechanism: Mechanism, symbol: str, timeframe: str) -> 
         return None
 
 
-# ── Built-in triggers for M001 (Liquidity Exhaustion) ────────────────────────
+# ── Built-in triggers ────────────────────────────────────────────────────────
 def _m001_trigger() -> Tuple[str, Callable]:
-    """Overbought Z‑score > +2.5 (asymmetric — only tops predict reversal)."""
     return ("z_overbought_2.5", lambda df: df["z_score"] > 2.5)
 
 _register_trigger("M001", _m001_trigger)
 
-# ── M002 (Trend Continuation) ───────────────────────────────────────────────
 def _m002_trigger() -> Tuple[str, Callable]:
-    """ROC(5) > 0.5% — momentum driver (see D021)."""
-    close_vals = "close"  # placeholder; actual column name used in lambda
     def condition(df: pd.DataFrame) -> pd.Series:
         close = df["close"]
         roc = (close - close.shift(5)) / close.shift(5)
@@ -80,27 +91,105 @@ def _m002_trigger() -> Tuple[str, Callable]:
 
 _register_trigger("M002", _m002_trigger)
 
-# ── M003‑M005 are not yet mapped (require OI / funding enrichment) ───────────
-# They will be added as the data pipeline supports headless enrichment.
-# For now the scheduler will skip them gracefully.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Bayesian Belief State
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class BeliefState:
+    """
+    Per‑combination (mechanism, symbol, timeframe) Bayesian belief about the
+    effect size (μ).  We assume μ ~ N(prior_mean, prior_var) and a Normal
+    likelihood with known variance (sample variance).  The posterior is also
+    Normal; this class stores the parameters needed to compute it.
+    """
+    prior_mean: float = 0.0          # prior mean (basis points)
+    prior_var: float = 400.0         # prior variance (20 bp std)
+    n: int = 0                       # number of observations
+    sample_mean: float = 0.0         # sample mean (bp)
+    sample_var: float = 0.0          # sample variance (bp**2)
+    last_updated: str = ""
+
+    @property
+    def posterior_mean(self) -> float:
+        if self.n == 0:
+            return self.prior_mean
+        prior_prec = 1.0 / max(self.prior_var, 1e-9)
+        sample_prec = self.n / max(self.sample_var, 1e-9)
+        return (prior_prec * self.prior_mean + sample_prec * self.sample_mean) / (prior_prec + sample_prec)
+
+    @property
+    def posterior_var(self) -> float:
+        if self.n == 0:
+            return self.prior_var
+        prior_prec = 1.0 / max(self.prior_var, 1e-9)
+        sample_prec = self.n / max(self.sample_var, 1e-9)
+        return 1.0 / (prior_prec + sample_prec)
+
+    def prob_effect_gt(self, threshold: float = 5.0) -> float:
+        """Posterior probability that the true effect size (in bp) > threshold."""
+        mu = self.posterior_mean
+        sigma = math.sqrt(max(self.posterior_var, 1e-9))
+        # standard normal survival function
+        from math import erf
+        def norm_sf(z):
+            return 0.5 - 0.5 * erf(z / math.sqrt(2.0))
+        if sigma == 0:
+            return 1.0 if mu > threshold else 0.0
+        z = (mu - threshold) / sigma
+        return norm_sf(-z)
+
+    def update(self, mean_bp: float, var_bp: float, n: int):
+        """Update belief with a new experiment's results."""
+        if n <= 0:
+            return
+        self.sample_mean = mean_bp
+        self.sample_var = max(var_bp, 1e-6)
+        self.n = n
+        self.last_updated = datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self):
+        return {
+            "prior_mean": self.prior_mean,
+            "prior_var": self.prior_var,
+            "n": self.n,
+            "sample_mean": self.sample_mean,
+            "sample_var": self.sample_var,
+            "last_updated": self.last_updated,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(**d)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Priority Policies
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def default_priority(mechanism: Mechanism, n_assets: int, n_regimes: int, cost_estimate: float) -> float:
+def default_priority(
+    mechanism: Mechanism,
+    n_assets: int,
+    n_regimes: int,
+    cost_estimate: float,
+    belief_prob: Optional[float] = None,
+) -> float:
     """
     Default information‑gain priority.
 
-    Higher = more valuable experiment.
+    If *belief_prob* is provided (posterior probability that effect > 5 bp),
+    the information gap is 1 - belief_prob.  Otherwise the gap is based on the
+    mechanism's global confidence score.
     """
-    confidence = mechanism.confidence_score() if mechanism else 0.0
-    # Diminishing returns on asset count and regime count (logarithmic)
+    if belief_prob is not None:
+        info_gap = 1.0 - belief_prob
+    else:
+        confidence = mechanism.confidence_score() if mechanism else 0.0
+        info_gap = 1.0 - confidence
+
     asset_bonus = math.log2(n_assets + 1)
     regime_bonus = math.log2(n_regimes + 1)
-    # Information gap (uncertainty) drives priority
-    info_gap = 1.0 - confidence
     return info_gap * (asset_bonus + regime_bonus) / max(cost_estimate, 1e-3)
 
 
@@ -110,7 +199,7 @@ def default_priority(mechanism: Mechanism, n_assets: int, n_regimes: int, cost_e
 
 class ExperimentScheduler:
     """
-    Generic experiment scheduler.
+    Generic experiment scheduler with Bayesian belief tracking.
 
     Responsibilities
     ----------------
@@ -118,25 +207,32 @@ class ExperimentScheduler:
     - Prioritise queue via a pluggable policy function.
     - Execute experiments using EventStudy, respecting a per‑cycle budget.
     - Update the mechanism registry and evidence ladder with results.
-    - Apply stopping rules to avoid repeating dead‑ends.
+    - Apply stopping rules and exploration/exploitation.
+    - Maintain a per‑combination belief state for Bayesian evidence accumulation.
     """
 
     DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
     DEFAULT_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+    EXPLORATION_RATE = 0.2   # 20% of batches go to random exploration
+    MIN_EFFECT_THRESHOLD_BP = 5.0  # minimum effect to consider actionable
 
     def __init__(
         self,
         ladder: Optional[EvidenceLadder] = None,
         registry: Optional[MechanismRegistry] = None,
         queue_path: Optional[Path] = None,
+        belief_path: Optional[Path] = None,
     ):
         self.ladder = ladder or EvidenceLadder()
         self.ladder.load()
         self.registry = registry or _registry
         self.queue_path = Path(queue_path or "data/experiments/research_queue.json")
+        self.belief_path = Path(belief_path or "data/experiments/belief_state.json")
         self._queue: List[Dict[str, Any]] = []
-        self._blacklist: set = set()  # (mechanism_id, symbol, timeframe)
+        self._blacklist: set = set()
+        self._beliefs: Dict[Tuple[str, str, str], BeliefState] = {}
         self._load_queue()
+        self._load_beliefs()
 
     # ── Queue management ────────────────────────────────────────────────────
 
@@ -161,24 +257,17 @@ class ExperimentScheduler:
         self.queue_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
     def generate_candidates(self):
-        """Fill the queue with experiments for every mechanism‑symbol‑timeframe combination.
-
-        Skips any combination that is blacklisted or already completed.
-        """
+        """Fill the queue with experiments for every mechanism‑symbol‑timeframe combination."""
         for mid, mech in self.registry._mechanisms.items():
-            if mid.startswith("_"):   # skip internal keys if any
+            if mid.startswith("_"):
                 continue
-            # Determine allowed symbols / timeframes for this mechanism
             symbols = self.DEFAULT_SYMBOLS
             timeframes = self.DEFAULT_TIMEFRAMES
-            # (Future enhancement: read per‑mechanism constraints from mechanism metadata)
 
             for sym in symbols:
                 for tf in timeframes:
-                    # Skip blacklisted
                     if (mid, sym, tf) in self._blacklist:
                         continue
-                    # Skip if already in queue with a final status
                     existing = next(
                         (e for e in self._queue
                          if e["mechanism_id"] == mid and e["symbol"] == sym and e["timeframe"] == tf),
@@ -187,13 +276,16 @@ class ExperimentScheduler:
                     if existing and existing.get("status") in ("completed", "rejected"):
                         continue
 
-                    # Compute cost estimate (simplified – 50k bars per experiment)
-                    cost_estimate = 1.0  # unit cost; can be refined later
+                    cost_estimate = 1.0
+                    # Retrieve belief for this combination
+                    belief = self._beliefs.get((mid, sym, tf))
+                    prob = belief.prob_effect_gt(self.MIN_EFFECT_THRESHOLD_BP) if belief else None
                     priority = default_priority(
                         mech,
                         n_assets=len(symbols),
-                        n_regimes=3,  # trend, vol, volume
+                        n_regimes=3,
                         cost_estimate=cost_estimate,
+                        belief_prob=prob,
                     )
                     entry = {
                         "mechanism_id": mid,
@@ -204,13 +296,46 @@ class ExperimentScheduler:
                         "last_run": None,
                         "result_summary": None,
                     }
-                    # Update existing or append
                     if existing:
                         existing.update(entry)
                     else:
                         self._queue.append(entry)
 
         self._save_queue()
+
+    # ── Belief state persistence ────────────────────────────────────────────
+
+    def _load_beliefs(self):
+        if not self.belief_path.exists():
+            return
+        try:
+            data = json.loads(self.belief_path.read_text(encoding="utf-8"))
+            for key_str, val in data.get("beliefs", {}).items():
+                mid, sym, tf = key_str.split("|")
+                self._beliefs[(mid, sym, tf)] = BeliefState.from_dict(val)
+        except Exception as exc:
+            logger.warning("Could not load belief state: %s", exc)
+
+    def _save_beliefs(self):
+        self.belief_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "beliefs": {
+                f"{mid}|{sym}|{tf}": belief.to_dict()
+                for (mid, sym, tf), belief in self._beliefs.items()
+            },
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.belief_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+    def _update_belief(self, mid: str, sym: str, tf: str, mean_bp: float, var_bp: float, n: int):
+        key = (mid, sym, tf)
+        belief = self._beliefs.get(key, BeliefState())
+        belief.update(mean_bp, var_bp, n)
+        self._beliefs[key] = belief
+        logger.info(
+            "Belief updated: %s|%s|%s -> mean=%.1f bp, var=%.1f, n=%d, P(>5bp)=%.3f",
+            mid, sym, tf, mean_bp, var_bp, n, belief.prob_effect_gt(self.MIN_EFFECT_THRESHOLD_BP),
+        )
 
     # ── Prioritisation ──────────────────────────────────────────────────────
 
@@ -219,21 +344,24 @@ class ExperimentScheduler:
         priority_fn: Optional[Callable[[Dict[str, Any]], float]] = None,
         max_experiments: int = 20,
     ) -> List[Dict[str, Any]]:
-        """
-        Sort the pending queue by priority (descending) and return up to *max_experiments*
-        of the highest‑priority experiments that are still pending and not blacklisted.
-
-        *priority_fn* may modify the priority score per entry.
-        """
+        """Return up to *max_experiments* pending experiments, highest‑priority first."""
         pending = [
             e for e in self._queue
-            if e.get("status") == "pending" and (e["mechanism_id"], e["symbol"], e["timeframe"]) not in self._blacklist
+            if e.get("status") == "pending"
+            and (e["mechanism_id"], e["symbol"], e["timeframe"]) not in self._blacklist
         ]
         if priority_fn is not None:
             for e in pending:
                 e["priority"] = round(priority_fn(e), 6)
 
         pending.sort(key=lambda x: x["priority"], reverse=True)
+
+        # Exploration: with some probability, insert a random pending experiment
+        if pending and random.random() < self.EXPLORATION_RATE:
+            idx = random.randrange(len(pending))
+            exp = pending.pop(idx)
+            pending.insert(0, exp)
+
         return pending[:max_experiments]
 
     # ── Execution ───────────────────────────────────────────────────────────
@@ -243,11 +371,7 @@ class ExperimentScheduler:
         budget: int = 3,
         priority_fn: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Run one full scheduling‑execution cycle.
-
-        Returns list of result summaries.
-        """
+        """Run one full scheduling‑execution cycle."""
         if not self._queue:
             self.generate_candidates()
 
@@ -257,6 +381,7 @@ class ExperimentScheduler:
             res = self._run_experiment(exp)
             results.append(res)
             self._save_queue()
+            self._save_beliefs()
             self.registry.save()
             self.ladder.save()
         return results
@@ -275,7 +400,6 @@ class ExperimentScheduler:
             exp["result_summary"] = "Unknown mechanism"
             return exp
 
-        # Obtain trigger
         trigger_info = trigger_for_mechanism(mech, symbol, timeframe)
         if trigger_info is None:
             exp["status"] = "skipped"
@@ -301,23 +425,48 @@ class ExperimentScheduler:
             return exp
 
         best = study.best_result() or results[0]
-        # Build summary
+        # Determine best horizon for summary and belief update
+        if best.significant_horizons:
+            best_h = min(best.significant_horizons, key=lambda h: best.t_pvalue.get(h, 1))
+        else:
+            # fallback to horizon with lowest p-value
+            best_h = min(best.t_pvalue.keys(), key=lambda h: best.t_pvalue[h]) if best.t_pvalue else 5
+
+        mean_return = best.mean_return.get(best_h, 0.0)
+        ci_low = best.bootstrap_ci_lower.get(best_h, mean_return)
+        ci_high = best.bootstrap_ci_upper.get(best_h, mean_return)
+        std_return = best.std_return.get(best_h, 0.0)
+        n_events = best.n_events
+        p_val = best.t_pvalue.get(best_h, 1.0)
+
+        mean_bp = mean_return * 10000.0
+        ci_low_bp = ci_low * 10000.0
+        ci_high_bp = ci_high * 10000.0
+        std_bp = std_return * 10000.0
+
+        # Use raw returns for variance estimation if available
+        eff_var_bp = (std_bp ** 2) if std_bp > 0 else 1.0
+        if best_h in best.raw_returns:
+            raw = best.raw_returns[best_h]
+            if len(raw) > 0:
+                eff_var_bp = float(np.var(raw) * 1e8)  # log-return variance → bp²
+
         summary = {
             "trigger": trig_name,
-            "n_events": best.n_events,
+            "n_events": n_events,
             "significant_horizons": best.significant_horizons,
-            "best_horizon": min(best.significant_horizons, key=lambda h: best.t_pvalue.get(h, 1)) if best.significant_horizons else None,
-            "best_p": min(best.t_pvalue.values()) if best.t_pvalue else 1.0,
-            "best_mean_bp": (best.mean_return.get(
-                min(best.significant_horizons, key=lambda h: best.t_pvalue.get(h, 1))
-            ) * 10000) if best.significant_horizons else 0.0,
+            "best_horizon": best_h if best.significant_horizons else None,
+            "best_p": p_val,
+            "best_mean_bp": round(mean_bp, 2),
+            "best_ci_low_bp": round(ci_low_bp, 2),
+            "best_ci_high_bp": round(ci_high_bp, 2),
+            "best_std_bp": round(std_bp, 2),
         }
 
         # ── Stopping rules ──────────────────────────────────────────────────
-        # Reject if: (a) no significant horizon, or (b) best p > 0.2 AND effect < 5 bp
         reject = False
         if not best.significant_horizons:
-            if summary["best_p"] > 0.2 and abs(summary["best_mean_bp"]) < 5.0 and best.n_events > 10:
+            if p_val > 0.2 and abs(mean_bp) < 5.0 and n_events > 10:
                 reject = True
         if reject:
             self._blacklist.add((mid, symbol, timeframe))
@@ -328,22 +477,26 @@ class ExperimentScheduler:
             exp["status"] = "completed"
             exp["result_summary"] = summary
 
-        # ── Update mechanism (effect summary) ───────────────────────────────
-        if best.significant_horizons:
-            best_h = min(best.significant_horizons, key=lambda h: best.t_pvalue.get(h, 1))
-            # Store per‑asset per‑timeframe effect using composite key
-            effect_key = f"{symbol}_{timeframe}"
-            if effect_key not in mech.effect_summary:
-                mech.effect_summary[effect_key] = {}
-            mech.effect_summary[effect_key].update({
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "horizon": best_h,
-                "mean_bp": round(summary["best_mean_bp"], 2),
-                "p_value": summary["best_p"],
-            })
+        # ── Update mechanism effect summary ─────────────────────────────────
+        effect_key = f"{symbol}_{timeframe}"
+        if effect_key not in mech.effect_summary:
+            mech.effect_summary[effect_key] = {}
+        mech.effect_summary[effect_key].update({
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "horizon": best_h,
+            "mean_bp": round(mean_bp, 2),
+            "ci_low_bp": round(ci_low_bp, 2),
+            "ci_high_bp": round(ci_high_bp, 2),
+            "std_bp": round(std_bp, 2),
+            "n_events": n_events,
+            "p_value": p_val,
+        })
 
-        # Update ladder: create/update a hypothesis record for the mechanism experiment
+        # ── Update belief state ─────────────────────────────────────────────
+        self._update_belief(mid, symbol, timeframe, mean_bp, eff_var_bp, n_events)
+
+        # ── Update evidence ladder ──────────────────────────────────────────
         hypo_id = f"{mid}_{symbol}_{timeframe}"
         record = self.ladder.get(hypo_id)
         if record is None:
@@ -361,10 +514,10 @@ class ExperimentScheduler:
             self.ladder.register(record)
 
         stage_result = StageResult(
-            stage=2,  # In-sample discovery (approximation)
+            stage=2,
             name="EventStudy",
             passed=bool(best.significant_horizons),
-            notes=f"Best p={summary['best_p']:.4f}, mean={summary['best_mean_bp']:.1f} bp",
+            notes=f"Best p={p_val:.4f}, mean={mean_bp:.1f} bp, CI=[{ci_low_bp:.1f}, {ci_high_bp:.1f}]",
         )
         if best.significant_horizons:
             record.promote(EvidenceLevel.L1, stage_result)
@@ -373,6 +526,7 @@ class ExperimentScheduler:
 
         return exp
 
+
 # ── Quick entry point ────────────────────────────────────────────────────────
 def main():
     scheduler = ExperimentScheduler()
@@ -380,7 +534,11 @@ def main():
     print(f"Queue size: {len(scheduler._queue)}")
     results = scheduler.run_cycle(budget=2)
     for r in results:
-        print(f"{r['mechanism_id']} {r['symbol']}/{r['timeframe']} -> {r['status']}: {r.get('result_summary')}")
+        print(
+            f"{r['mechanism_id']} {r['symbol']}/{r['timeframe']} -> "
+            f"{r['status']}: {r.get('result_summary')}"
+        )
+
 
 if __name__ == "__main__":
     main()

@@ -40,9 +40,13 @@ the other was completed successfully and produced a significant horizon at h=20.
   (p > 0.20, effect < 5 bp, >10 events). This matches the known fact (D019)
   that M001 is not visible on 15m. The scheduler correctly avoided retrying
   this combination.
-- The 1h result extends the M001 validity to a richer set of timeframes.
-  The mechanism’s effect jumps from 3.6 bp at 15m to 27.1 bp at 1h, supporting
-  the non‑linear scaling described in D019.
+- The 1h result shows an effect size of +27.1 bp, which is consistent with the
+  non‑linear scaling pattern described in D019. Because we have only tested a
+  single symbol and a single mechanism, this result should be viewed as
+  **supporting evidence for D019**, not as a full confirmation of that
+  discovery. Additional tests on ETH, SOL, BNB across multiple timeframes are
+  required before D019’s non‑linear scaling can be considered established for
+  M001 on 1h.
 
 ---
 
