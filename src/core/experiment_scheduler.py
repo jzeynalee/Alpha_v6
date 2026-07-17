@@ -34,6 +34,14 @@ Version 5 adds:
 - Automatic OI data enrichment for mechanisms that require Open Interest.
 - Trigger variants are registered in `_MECHANISM_TRIGGER_VARIANTS`.
 
+Version 6 adds:
+
+- Trigger mappings for M004 (Funding Rotation) and M005 (Volatility Compression).
+- M004 now requires data enrichment (funding rate) — automatically handled.
+- The queue now generates experiments for M004 and M005 across all assets and
+  timeframes, enabling the scheduler to test these mechanisms without manual
+  setup.
+
 Usage
 -----
     from src.core.experiment_scheduler import ExperimentScheduler
@@ -112,6 +120,7 @@ def _m002_trigger() -> Tuple[str, Callable]:
 
 _register_trigger("M002", _m002_trigger)
 
+
 # ── Multi‑trigger variants ──────────────────────────────────────────────────
 # Key: mechanism_id → list of (trigger_name, condition_fn)
 # These will be added as separate queue entries.
@@ -126,6 +135,30 @@ _MECHANISM_TRIGGER_VARIANTS: Dict[str, List[Tuple[str, Callable]]] = {
             "oi_div_bullish",
             lambda df: (df["close"] < df["sma20"])
             & (df["sum_open_interest"] > df["sum_open_interest"].rolling(20).mean()),
+        ),
+    ],
+    "M004": [
+        (
+            "funding_over_2p0",
+            lambda df: (
+                (df["funding_rate"].rolling(100).std() > 0)
+                & ((df["funding_rate"] - df["funding_rate"].rolling(100).mean())
+                   / df["funding_rate"].rolling(100).std() > 2.0)
+            ),
+        ),
+        (
+            "funding_under_neg2p0",
+            lambda df: (
+                (df["funding_rate"].rolling(100).std() > 0)
+                & ((df["funding_rate"] - df["funding_rate"].rolling(100).mean())
+                   / df["funding_rate"].rolling(100).std() < -2.0)
+            ),
+        ),
+    ],
+    "M005": [
+        (
+            "vol_comp_low",
+            lambda df: df["atr_percentile"] < 0.33,
         ),
     ],
 }
@@ -267,8 +300,8 @@ class ExperimentScheduler:
     DEFAULT_NULL_MODEL_TF = "4h"
     DEFAULT_WF_WINDOWS = 6
 
-    # Mechanisms that require OI enrichment
-    OI_REQUIRED_MECHANISMS = {"M003"}
+    # Mechanisms that require data enrichment (OI / funding)
+    ENRICH_REQUIRED_MECHANISMS = {"M003", "M004"}
 
     def __init__(
         self,
@@ -388,7 +421,7 @@ class ExperimentScheduler:
                     else:
                         self._queue.append(entry)
 
-        # Multi‑trigger variants (M003 bearish/bullish)
+        # Multi‑trigger variants (M003, M004, M005)
         for mid, variants in _MECHANISM_TRIGGER_VARIANTS.items():
             symbols = self.DEFAULT_SYMBOLS
             timeframes = self.DEFAULT_TIMEFRAMES
@@ -474,18 +507,18 @@ class ExperimentScheduler:
             mid, sym, tf, mean_bp, var_bp, n, belief.prob_effect_gt(self.MIN_EFFECT_THRESHOLD_BP),
         )
 
-    # ── OI enrichment ───────────────────────────────────────────────────────
+    # ── Data enrichment (OI / funding) ─────────────────────────────────────
 
-    def _enrich_oi(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-        """Add Open Interest columns for mechanisms that require them."""
+    def _enrich_data(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """Add Open Interest and/or funding columns for mechanisms that require them."""
         try:
             from src.features.positioning_enricher import enrich_ohlcv, clear_cache
             clear_cache()
             df = enrich_ohlcv(df, symbol)
-            logger.info("OI enrichment succeeded for %s (%d rows)", symbol, len(df))
+            logger.info("Data enrichment succeeded for %s (%d rows)", symbol, len(df))
             return df
         except Exception as exc:
-            logger.warning("OI enrichment failed for %s: %s", symbol, exc)
+            logger.warning("Data enrichment failed for %s: %s", symbol, exc)
             return df  # proceed without enrichment; triggers will likely fail gracefully
 
     # ── Prioritisation ──────────────────────────────────────────────────────
@@ -579,9 +612,9 @@ class ExperimentScheduler:
             df = study.load_data()
             df = study.compute_features(df)
 
-            # Enrich with OI if needed
-            if mid in self.OI_REQUIRED_MECHANISMS:
-                df = self._enrich_oi(df, symbol)
+            # Enrich with OI / funding if needed
+            if mid in self.ENRICH_REQUIRED_MECHANISMS:
+                df = self._enrich_data(df, symbol)
                 df = study.compute_features(df)  # re‑compute after enrichment
 
             study.add_trigger(trig_name_display, cond_fn)
