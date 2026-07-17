@@ -1,8 +1,7 @@
 """
 Experiment Scheduler — Generic, budget-aware discovery loop with Bayesian
 belief tracking, exploration/exploitation, autonomous replication, and
-automatic promotion to L3 (Walk‑Forward Validated) once cross‑asset replication
-requirements are met.
+automated promotion once posterior evidence exceeds a threshold.
 
 Automates the cycle:
     queue → prioritise → execute → update evidence → replicate → auto‑advance → repeat
@@ -12,57 +11,17 @@ trigger factories live here (or in companion modules). The scheduler
 itself does **not** contain any research logic — it only orchestrates
 existing components (EventStudy, MechanismRegistry, EvidenceLadder).
 
-Version 3 adds:
-
-- Automatic replication: when a significant result is found, the scheduler
-  immediately enqueues confirmation experiments on other assets for the same
-  mechanism and timeframe. Promotion decisions are deferred until a minimum
-  number of replications have been completed.
-
-Version 4 adds:
-
-- Null-model gate and walk-forward validation methods for advancing a mechanism
-  from L1/L2 to L3.
-- `run_advancement_checks(mechanism_id)` performs:
-    * null-model comparison (mechanism vs naïve `close > SMA20`) for each asset
-    * walk-forward validation on each asset (6-fold purged)
-    * updates the mechanism’s acceptance‑level, null‑model flag, and WF data.
-    * promotes the corresponding evidence‑ladder hypothesis to L3 if thresholds met.
-  This method is called by `scripts/run_research_cycle.py` with the `--promote` flag.
-
-Version 5 adds:
-
-- Multi‑trigger support per mechanism (e.g. M003 bearish / bullish OI divergence).
-- Automatic OI data enrichment for mechanisms that require Open Interest.
-- Trigger variants are registered in `_MECHANISM_TRIGGER_VARIANTS`.
-
-Version 6 adds:
-
-- Trigger mappings for M004 (Funding Rotation) and M005 (Volatility Compression).
-- M004 now requires data enrichment (funding rate) — automatically handled.
-- The queue now generates experiments for M004 and M005 across all assets and
-  timeframes, enabling the scheduler to test these mechanisms without manual
-  setup.
-
-Version 7 adds:
-
-- Automatic update of mechanism cross‑asset replication counts (n_assets_replicated,
-  n_assets_tested) after each experiment.
-- **Auto‑advance**: at the end of each cycle the scheduler checks whether any
-  mechanism has gathered ≥3 cross‑asset confirmations; if so, it automatically
-  runs the null‑model gate and walk‑forward validation — the mechanism is
-  promoted to L3 in the evidence ladder if both checks pass.
-
-Version 8 adds:
-
-- Automatic registration of validated mechanisms as AlphaStreams in the
-  AlphaEngine once they reach L3 (Walk‑Forward Validated).  The engine
-  persistently stores the stream configuration in
-  ``data/experiments/alpha_streams.json`` so it can be loaded later for
-  portfolio construction.
-- A `--review` mode in the CLI runner that prints the evidence state of every
-  mechanism, including effect summaries, promotion readiness, and a comparison
-  against the manual event‑study reports.
+Version 9 adds:
+- Dormant state replaces permanent blacklisting: failed experiments
+  are deferred for a configurable period and automatically become
+  re‑eligible afterwards.
+- Research‑debt tracking: experiments that require more data,
+  a different exchange, or an alternative trigger are recorded
+  so that they can be revisited later.
+- Promotion is evidence‑based: a mechanism auto‑advances only when its
+  pooled posterior probability that the true effect exceeds the
+  economic threshold surpasses a configurable level, rather than
+  when a predetermined number of assets are replicated.
 
 Usage
 -----
@@ -80,6 +39,7 @@ import json
 import logging
 import math
 import random
+import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -225,7 +185,6 @@ class BeliefState:
         """Posterior probability that the true effect size (in bp) > threshold."""
         mu = self.posterior_mean
         sigma = math.sqrt(max(self.posterior_var, 1e-9))
-        # standard normal survival function
         from math import erf
         def norm_sf(z):
             return 0.5 - 0.5 * erf(z / math.sqrt(2.0))
@@ -294,7 +253,7 @@ def default_priority(
 class ExperimentScheduler:
     """
     Generic experiment scheduler with Bayesian belief tracking,
-    autonomous replication, and automatic promotion to L3.
+    autonomous replication, and evidence‑based promotion.
 
     Responsibilities
     ----------------
@@ -302,27 +261,37 @@ class ExperimentScheduler:
     - Prioritise queue via a pluggable policy function.
     - Execute experiments using EventStudy, respecting a per‑cycle budget.
     - Update the mechanism registry and evidence ladder with results.
-    - Apply stopping rules and exploration/exploitation.
+    - Apply stopping rules: failures become DORMANT for a configurable period.
+      Dormant experiments may be re‑tested later, rather than being permanently
+      excluded.
     - Maintain a per‑combination belief state for Bayesian evidence accumulation.
     - Automatically schedule replication experiments for significant results.
-    - Track cross‑asset replication counts and automatically run null‑model gate
-      + walk‑forward validation (→ L3 promotion) once ≥3 replications exist.
+    - When a mechanism’s pooled posterior probability that the true effect
+      exceeds the economic threshold surpasses a configurable level, the
+      scheduler triggers the advancement pipeline (null‑model + walk‑forward).
     - Register validated mechanisms as AlphaStreams for the AlphaEngine.
+    - Track research debt: experiments that require more data, a different
+      exchange, or an alternative trigger.
 
     """
 
     DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
     DEFAULT_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
     EXPLORATION_RATE = 0.2
-    MIN_EFFECT_THRESHOLD_BP = 5.0
-    MIN_REPLICATIONS_REQUIRED = 3
-    SIGNIFICANCE_THRESHOLD = 0.05
+    MIN_EFFECT_THRESHOLD_BP = 5.0         # economic threshold
+    SIGNIFICANCE_THRESHOLD = 0.05         # p‑value gate
     REPLICATION_TIMEFRAMES = ["1h", "4h", "1d"]
+
+    # Promotion is evidence‑based, not count‑based.
+    ADVANCE_PROB_THRESHOLD = 0.9          # posterior P(μ > economic threshold)
 
     # Parameters for advancement checks
     DEFAULT_NULL_MODEL_ASSETS = ["ETHUSDT", "SOLUSDT", "BNBUSDT"]
     DEFAULT_NULL_MODEL_TF = "4h"
     DEFAULT_WF_WINDOWS = 6
+
+    # Dormant experiments are ignored for DORMANT_PERIOD_DAYS, then re‑eligible.
+    DORMANT_PERIOD_DAYS = 180
 
     # Mechanisms that require data enrichment (OI / funding)
     ENRICH_REQUIRED_MECHANISMS = {"M003", "M004"}
@@ -342,17 +311,22 @@ class ExperimentScheduler:
         registry: Optional[MechanismRegistry] = None,
         queue_path: Optional[Path] = None,
         belief_path: Optional[Path] = None,
+        debt_path: Optional[Path] = None,
     ):
         self.ladder = ladder or EvidenceLadder()
         self.ladder.load()
         self.registry = registry or _registry
         self.queue_path = Path(queue_path or "data/experiments/research_queue.json")
         self.belief_path = Path(belief_path or "data/experiments/belief_state.json")
+        self.debt_path = Path(debt_path or "data/experiments/research_debt.json")
         self._queue: List[Dict[str, Any]] = []
-        self._blacklist: set = set()
+        # dormant experiments: key → dormant_until (Unix timestamp)
+        self._dormant: Dict[Tuple[str, str, str, str], float] = {}
         self._beliefs: Dict[Tuple[str, str, str], BeliefState] = {}
+        self._research_debt: List[Dict[str, Any]] = []
         self._load_queue()
         self._load_beliefs()
+        self._load_debt()
 
     # ── Queue management ────────────────────────────────────────────────────
 
@@ -362,9 +336,11 @@ class ExperimentScheduler:
         try:
             data = json.loads(self.queue_path.read_text(encoding="utf-8"))
             self._queue = data.get("experiments", [])
-            bl = data.get("blacklist", [])
-            # blacklist elements: [mid, sym, tf, trigger_name] (trigger_name optional)
-            self._blacklist = {self._normalise_blacklist_key(x) for x in bl}
+            dorm = data.get("dormant", [])
+            self._dormant = {
+                (x[0], x[1], x[2], x[3]): x[4]
+                for x in dorm if len(x) >= 5
+            }
         except Exception as exc:
             logger.warning("Could not load research queue: %s", exc)
 
@@ -372,22 +348,16 @@ class ExperimentScheduler:
         self.queue_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "experiments": self._queue,
-            "blacklist": [list(x) for x in self._blacklist],
+            "dormant": [
+                list(key) + [dormant_until]
+                for key, dormant_until in self._dormant.items()
+            ],
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         self.queue_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
     @staticmethod
-    def _normalise_blacklist_key(raw) -> tuple:
-        """Convert a blacklist entry to (mid, sym, tf, trigger)."""
-        if isinstance(raw, (list, tuple)):
-            parts = list(raw)
-            while len(parts) < 4:
-                parts.append("")
-            return tuple(parts[:4])
-        return (raw, "", "", "")
-
-    def _exp_key(self, exp: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    def _exp_key(exp: Dict[str, Any]) -> Tuple[str, str, str, str]:
         return (
             exp["mechanism_id"],
             exp["symbol"],
@@ -395,11 +365,26 @@ class ExperimentScheduler:
             exp.get("trigger_name", ""),
         )
 
-    def _is_blacklisted(self, exp: Dict[str, Any]) -> bool:
+    def _is_dormant(self, exp: Dict[str, Any]) -> bool:
         key = self._exp_key(exp)
-        # also check without trigger
-        key_no_trigger = (key[0], key[1], key[2], "")
-        return key in self._blacklist or key_no_trigger in self._blacklist
+        if key in self._dormant:
+            return _time.time() < self._dormant[key]
+        return False
+
+    def _make_dormant(self, exp: Dict[str, Any], reason: str = ""):
+        key = self._exp_key(exp)
+        dormant_until = _time.time() + self.DORMANT_PERIOD_DAYS * 86400
+        self._dormant[key] = dormant_until
+        logger.info(
+            "Experiment %s|%s|%s [%s] made dormant until %s: %s",
+            key[0], key[1], key[2], key[3],
+            datetime.utcfromtimestamp(dormant_until).isoformat(),
+            reason,
+        )
+
+    def _reset_dormant(self, exp: Dict[str, Any]):
+        key = self._exp_key(exp)
+        self._dormant.pop(key, None)
 
     def generate_candidates(self):
         """Fill the queue with experiments for every mechanism‑symbol‑timeframe combination."""
@@ -418,8 +403,9 @@ class ExperimentScheduler:
                         "timeframe": tf,
                         "trigger_name": "",
                     }
-                    if self._is_blacklisted(exp):
-                        continue
+                    if self._is_dormant(exp):
+                        # re‑enrol if dormant period has expired
+                        self._reset_dormant(exp)
                     existing = next(
                         (e for e in self._queue
                          if e["mechanism_id"] == mid and e["symbol"] == sym and e["timeframe"] == tf
@@ -467,8 +453,8 @@ class ExperimentScheduler:
                             "timeframe": tf,
                             "trigger_name": tname,
                         }
-                        if self._is_blacklisted(exp):
-                            continue
+                        if self._is_dormant(exp):
+                            self._reset_dormant(exp)
                         existing = next(
                             (e for e in self._queue
                              if e["mechanism_id"] == mid and e["symbol"] == sym
@@ -540,6 +526,35 @@ class ExperimentScheduler:
             mid, sym, tf, mean_bp, var_bp, n, belief.prob_effect_gt(self.MIN_EFFECT_THRESHOLD_BP),
         )
 
+    # ── Research‑debt tracking ─────────────────────────────────────────────
+
+    def _load_debt(self):
+        if not self.debt_path.exists():
+            return
+        try:
+            self._research_debt = json.loads(self.debt_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not load research debt: %s", exc)
+
+    def _save_debt(self):
+        self.debt_path.parent.mkdir(parents=True, exist_ok=True)
+        self.debt_path.write_text(json.dumps(self._research_debt, indent=2, default=str), encoding="utf-8")
+
+    def _add_research_debt(self, exp: Dict[str, Any], reason: str):
+        entry = {
+            "mechanism_id": exp["mechanism_id"],
+            "symbol": exp["symbol"],
+            "timeframe": exp["timeframe"],
+            "trigger_name": exp.get("trigger_name", ""),
+            "reason": reason,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._research_debt.append(entry)
+        self._save_debt()
+        logger.info("Research debt recorded: %s|%s|%s [%s] – %s",
+                    exp["mechanism_id"], exp["symbol"], exp["timeframe"],
+                    exp.get("trigger_name", ""), reason)
+
     # ── Data enrichment (OI / funding) ─────────────────────────────────────
 
     def _enrich_data(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -565,7 +580,7 @@ class ExperimentScheduler:
         pending = [
             e for e in self._queue
             if e.get("status") == "pending"
-            and not self._is_blacklisted(e)
+            and not self._is_dormant(e)
         ]
         if priority_fn is not None:
             for e in pending:
@@ -602,8 +617,8 @@ class ExperimentScheduler:
             self.registry.save()
             self.ladder.save()
 
-        # After processing the batch, attempt to advance any mechanism that now
-        # has ≥3 cross‑asset replications.
+        # After processing the batch, attempt to advance any mechanism whose
+        # pooled posterior evidence exceeds the promotion threshold.
         self._auto_advance_mechanisms()
 
         return results
@@ -713,11 +728,11 @@ class ExperimentScheduler:
             if p_val > 0.2 and abs(mean_bp) < 5.0 and n_events > 10:
                 reject = True
         if reject:
-            # blacklist the specific combination
-            self._blacklist.add(self._exp_key(exp))
-            exp["status"] = "rejected"
+            # Mark as dormant rather than permanently blacklisted
+            self._make_dormant(exp, reason="No significant predictive power")
+            exp["status"] = "dormant"
             exp["result_summary"] = summary
-            logger.info("Experiment %s/%s/%s [%s] rejected (stopping rule)", mid, symbol, timeframe, trigger_name)
+            logger.info("Experiment %s/%s/%s [%s] parked as dormant", mid, symbol, timeframe, trigger_name)
         else:
             exp["status"] = "completed"
             exp["result_summary"] = summary
@@ -775,6 +790,14 @@ class ExperimentScheduler:
         if best.significant_horizons:
             self._schedule_replications(exp, p_val, mean_bp)
 
+        # ── Research‑debt assessment ────────────────────────────────────────
+        if best.significant_horizons:
+            if (ci_high_bp - ci_low_bp) > 100:
+                self._add_research_debt(exp, "large_confidence_interval")
+        else:
+            if abs(mean_bp) > 10 and n_events > 10:
+                self._add_research_debt(exp, "large_effect_not_significant")
+
         # ── Update mechanism cross‑asset counts ─────────────────────────────
         self._update_mechanism_counts(mech)
 
@@ -815,10 +838,12 @@ class ExperimentScheduler:
 
     def _ensure_experiment(self, mechanism_id: str, symbol: str, timeframe: str, parent_id: str,
                            trigger_name: str = ""):
-        """Add a pending experiment for the given combination unless already present or blacklisted."""
+        """Add a pending experiment for the given combination unless already present or dormant."""
         key = (mechanism_id, symbol, timeframe, trigger_name)
-        if key in self._blacklist:
-            return
+        if key in self._dormant:
+            # reschedule even if dormant? The replication request bypasses dormancy.
+            self._reset_dormant({"mechanism_id": mechanism_id, "symbol": symbol,
+                                 "timeframe": timeframe, "trigger_name": trigger_name})
         existing = next(
             (e for e in self._queue
              if e["mechanism_id"] == mechanism_id
@@ -827,7 +852,7 @@ class ExperimentScheduler:
              and e.get("trigger_name", "") == trigger_name),
             None,
         )
-        if existing and existing.get("status") in ("completed", "rejected", "pending"):
+        if existing and existing.get("status") in ("completed", "rejected", "dormant", "pending"):
             return
 
         mech = self.registry.get(mechanism_id)
@@ -878,6 +903,65 @@ class ExperimentScheduler:
         mech.n_assets_tested = len(tested)
         logger.info("Mechanism %s cross‑asset counts updated: replicated=%d, tested=%d",
                     mech.mechanism_id, mech.n_assets_replicated, mech.n_assets_tested)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  Evidence‑based advancement
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _mechanism_posterior_prob(self, mechanism_id: str, threshold: float = 5.0) -> float:
+        """
+        Pooled posterior probability that the mechanism’s true effect exceeds *threshold*.
+
+        Combines all per‑combination effect‑summary entries (using their
+        sample mean, variance, and event counts) with the standard Normal prior.
+        """
+        mech = self.registry.get(mechanism_id)
+        if mech is None or not mech.effect_summary:
+            return 0.0
+
+        prior_prec = 1.0 / 400.0   # same prior as BeliefState
+        total_prec = prior_prec
+        weighted_sum = 0.0
+
+        for key, val in mech.effect_summary.items():
+            mean_bp = val.get("mean_bp", 0.0)
+            std_bp = val.get("std_bp", 10.0)
+            n = val.get("n_events", 0)
+            if n == 0:
+                continue
+            var = max(std_bp ** 2, 1e-6)
+            prec = n / var
+            total_prec += prec
+            weighted_sum += prec * mean_bp
+
+        posterior_mean = weighted_sum / total_prec
+        posterior_sd = math.sqrt(1.0 / total_prec)
+
+        from math import erf
+        def norm_sf(z):
+            return 0.5 - 0.5 * erf(z / math.sqrt(2.0))
+        z = (posterior_mean - threshold) / max(posterior_sd, 1e-9)
+        return norm_sf(-z)
+
+    def _auto_advance_mechanisms(self):
+        """Check every mechanism’s pooled posterior probability and run advancement
+        checks if it exceeds the promotion threshold."""
+        for mid, mech in self.registry._mechanisms.items():
+            if mid.startswith("_"):
+                continue
+            prob = self._mechanism_posterior_prob(mid, self.MIN_EFFECT_THRESHOLD_BP)
+            logger.info(
+                "Mechanism %s pooled P(μ>%dbp)=%.4f (threshold %.2f)",
+                mid, self.MIN_EFFECT_THRESHOLD_BP, prob, self.ADVANCE_PROB_THRESHOLD,
+            )
+            if prob < self.ADVANCE_PROB_THRESHOLD:
+                continue
+            # Skip if null‑model gate already passed and walk‑forward was already run
+            if mech.null_model_beaten and mech.n_wf_windows_total > 0:
+                continue
+            logger.info("Evidence threshold met for %s (pooled prob=%.4f). Running advancement checks.",
+                        mid, prob)
+            self.run_advancement_checks(mid)
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Advancement Checks — null‑model gate + walk‑forward → L3 promotion
@@ -950,23 +1034,6 @@ class ExperimentScheduler:
         # --- auto‑register as AlphaStream if L3 reached ---
         if null_passed and wf_passed:
             self._maybe_register_alpha_stream(mechanism_id)
-
-    # ── Automatic advancement triggering ────────────────────────────────────
-
-    def _auto_advance_mechanisms(self):
-        """Check every mechanism for 3+ cross‑asset replications and run advancement checks
-        if they have not yet passed the null‑model gate."""
-        for mid, mech in self.registry._mechanisms.items():
-            if mid.startswith("_"):
-                continue
-            if mech.n_assets_replicated < self.MIN_REPLICATIONS_REQUIRED:
-                continue
-            # Skip if null‑model gate already passed and walk‑forward was already run
-            if mech.null_model_beaten and mech.n_wf_windows_total > 0:
-                continue
-            logger.info("Auto‑advance trigger met for %s (replicated=%d). Running advancement checks.",
-                        mid, mech.n_assets_replicated)
-            self.run_advancement_checks(mid)
 
     # ── null‑model comparison per asset ─────────────────────────────────────
 
