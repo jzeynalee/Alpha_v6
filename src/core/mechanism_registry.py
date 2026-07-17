@@ -1,0 +1,569 @@
+"""
+Mechanism Registry — Reusable market mechanism catalog.
+
+Instead of organizing research around named strategies (btc_mr_l2, eth_mom_l1),
+organize around REUSABLE MECHANISMS that can be combined into many strategies.
+
+A mechanism is a measurable market behavior:
+  - What condition triggers it (inputs)
+  - What it predicts (outputs)
+  - Under what conditions it works (boundaries)
+  - Why it exists (economic rationale)
+
+Mechanisms are LONG-LIVED assets. Strategies are SHORT-LIVED combinations.
+This registry separates the two.
+
+Architecture:
+    Mechanism (M001-M0XX)
+        ↓
+    Hypothesis (H071) = M001 + M003 + regime filter
+        ↓
+    Strategy (S014) = H071 + execution rules + risk management
+
+Usage:
+    from src.core.mechanism_registry import registry
+    m = registry.get("M001")
+    print(m.effect_summary())
+    boundary = registry.find_boundary("M001", "BTCUSDT", "15m")
+"""
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Discovery Types
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DiscoveryType(str, Enum):
+    """Classification of findings by permanence."""
+    STRUCTURAL = "structural"   # Unlikely to change: BTC≠ETH, costs matter
+    TACTICAL = "tactical"       # May evolve: regime thresholds, parameter values
+
+
+@dataclass
+class MechanismBoundary:
+    """Where a mechanism stops working."""
+    condition: str              # e.g. "ATR percentile > 67%"
+    effect_size_bp: float       # mean log return in bp outside boundary
+    events_inside: int
+    events_outside: int
+    p_value: float
+
+
+@dataclass
+class StabilityMetrics:
+    """Rolling-window stability of a mechanism's effect."""
+    rolling_6m_sharpe: List[float] = field(default_factory=list)
+    rolling_6m_mean_bp: List[float] = field(default_factory=list)
+    bootstrap_variance: float = 0.0
+    effect_persistence: float = 0.0  # autocorrelation of rolling effect
+
+
+@dataclass
+class Mechanism:
+    """
+    A reusable market mechanism.
+
+    Attributes
+    ----------
+    mechanism_id : str
+        e.g. "M001"
+    name : str
+        Human-readable name
+    description : str
+        What the mechanism is
+    economic_rationale : str
+        Why it should exist
+    discovery_type : DiscoveryType
+        STRUCTURAL or TACTICAL
+    inputs : List[str]
+        Required input features (e.g. ["z_score", "atr_percentile"])
+    trigger_fn : Optional[Callable]
+        Function(df) → boolean Series (True where mechanism activates)
+    effect_summary : Dict
+        Per-asset effect sizes at best horizon
+        e.g. {"BTCUSDT": {"horizon": 5, "mean_bp": 3.6, "p_value": 0.22}}
+    boundaries : List[MechanismBoundary]
+        Where it stops working
+    stability : Optional[StabilityMetrics]
+        Rolling window stability
+    used_by_hypotheses : List[str]
+        Which hypotheses use this mechanism
+    """
+
+    mechanism_id: str
+    name: str
+    description: str = ""
+    economic_rationale: str = ""
+    discovery_type: DiscoveryType = DiscoveryType.TACTICAL
+    inputs: List[str] = field(default_factory=list)
+    trigger_fn: Optional[Callable] = None
+    effect_summary: Dict[str, Dict] = field(default_factory=dict)
+    boundaries: List[MechanismBoundary] = field(default_factory=list)
+    stability: Optional[StabilityMetrics] = None
+    used_by_hypotheses: List[str] = field(default_factory=list)
+    # ── Frozen confidence components ────────────────────────────────────
+    n_assets_tested: int = 0          # Assets where mechanism confirmed at target tf
+    n_assets_replicated: int = 0      # Assets where mechanism replicates
+    n_wf_windows_passed: int = 0      # Walk-forward windows with positive effect
+    n_wf_windows_total: int = 4       # Total walk-forward windows attempted
+    parameter_plateau: bool = False   # Does threshold sweep show broad plateau?
+    null_model_beaten: bool = False   # Does mechanism beat random trigger?
+    discovery_period: str = ""        # e.g. "2022-2024"
+    confirmation_period: str = ""     # e.g. "2025-2026" (separate from discovery)
+    acceptance_level: int = 0         # 0=hypothesis,1=observed,2=replicated,3=cross-market,4=wf-validated,5=production
+    created_at: str = ""
+    updated_at: str = ""
+
+    def __post_init__(self):
+        if not self.created_at:
+            self.created_at = datetime.now(timezone.utc).isoformat()
+
+    def effect_size_rank(self) -> float:
+        """Composite score: effect size (bp) × (1 - p_value). Higher = better."""
+        if not self.effect_summary:
+            return 0.0
+        best = max(self.effect_summary.values(),
+                   key=lambda v: abs(v.get("mean_bp", 0)) * (1 - v.get("p_value", 1)))
+        mean_bp = abs(best.get("mean_bp", 0))
+        p_val = best.get("p_value", 1.0)
+        return mean_bp * (1.0 - p_val)
+
+    def confidence_score(self) -> float:
+        """
+        Composite mechanism confidence (0-1) from multiple dimensions.
+
+        Components:
+          - Assets tested (0-1): min(n_assets/5, 1.0)
+          - Regimes tested (0-1): min(n_regimes/3, 1.0)
+          - Years of data (0-1): min(n_years/5, 1.0)
+          - Walk-forward validation (0 or 0.3)
+          - Effect size (0-0.2): min(|mean_bp|/20, 0.2)
+          - Replications (0-0.1): min(n_replications/5, 0.1) * 0.1
+          - Structural bonus (0 or 0.1)
+
+        Weights sum to 1.0. Higher = more reliable mechanism.
+        """
+        scores = {
+            "assets": min(self.n_assets_tested / 5.0, 1.0) * 0.20,
+            "regimes": min(self.n_regimes_tested / 3.0, 1.0) * 0.15,
+            "years": min(self.n_years_data / 5.0, 1.0) * 0.15,
+            "walk_forward": (0.20 if self.walk_forward_passed else 0.0),
+        }
+
+        # Effect size contribution
+        best_effect = 0.0
+        for asset_data in self.effect_summary.values():
+            best_effect = max(best_effect, abs(asset_data.get("mean_bp", 0)))
+        scores["effect_size"] = min(best_effect / 20.0, 1.0) * 0.15
+
+        # Replications
+        scores["replications"] = min(self.n_replications / 5.0, 1.0) * 0.10
+
+        # Structural bonus
+        scores["structural"] = 0.05 if self.discovery_type == DiscoveryType.STRUCTURAL else 0.0
+
+        # Apply tactical decay
+        raw_score = sum(scores.values())
+        if self.discovery_type == DiscoveryType.TACTICAL and self.updated_at:
+            try:
+                age_days = (datetime.now(timezone.utc) -
+                           datetime.fromisoformat(self.updated_at)).days
+                decay = 0.20 ** (age_days / 365.0)  # 20% annual decay
+                raw_score *= max(decay, 0.3)  # Floor at 30% of original
+            except Exception:
+                pass
+
+        return round(raw_score, 4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pre-defined Mechanisms (M001-M005)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
+    "M001": Mechanism(
+        mechanism_id="M001",
+        name="Liquidity Exhaustion",
+        description="After a statistically extreme price move driven by temporary "
+                    "liquidity imbalance, price has a tendency to revert toward "
+                    "its local mean as liquidity providers re-enter.",
+        economic_rationale="Market makers withdraw liquidity during rapid moves, "
+                          "creating temporary vacuums. When they return, the spread "
+                          "compresses and price reverts. This is a microstructure "
+                          "phenomenon amplified by leverage in crypto.",
+        discovery_type=DiscoveryType.STRUCTURAL,
+        inputs=["z_score", "atr_percentile"],
+        effect_summary={
+            "BTCUSDT": {"horizon": 5, "mean_bp": 3.6, "p_value": 0.22, "best_regime": "low_vol"},
+        },
+        boundaries=[
+            MechanismBoundary("ATR percentile > 67%", -5.0, 350, 188, 0.01),
+            MechanismBoundary("ADX > 25", -2.0, 400, 138, 0.08),
+        ],
+    ),
+
+    "M002": Mechanism(
+        mechanism_id="M002",
+        name="Trend Continuation",
+        description="Assets in a confirmed trend (HTF SMA alignment) tend to "
+                    "continue in that direction over short horizons, with momentum "
+                    "decaying after 10-20 bars.",
+        economic_rationale="Institutional positioning and narrative-driven flows "
+                          "create persistent directional pressure. Retail traders "
+                          "chase trends, reinforcing the move until exhaustion.",
+        discovery_type=DiscoveryType.STRUCTURAL,
+        inputs=["sma10", "sma30", "sma50", "sma100", "roc_5", "volume_ratio"],
+        effect_summary={
+            "ETHUSDT": {"horizon": 10, "mean_bp": 12.0, "p_value": 0.02, "best_regime": "bull"},
+            "SOLUSDT": {"horizon": 5, "mean_bp": 8.0, "p_value": 0.05, "best_regime": "bull"},
+        },
+    ),
+
+    "M003": Mechanism(
+        mechanism_id="M003",
+        name="Position Unwind",
+        description="When price and Open Interest diverge (price rising but OI "
+                    "falling, or vice versa), existing positions are being closed "
+                    "without new conviction. This predicts a reversal.",
+        economic_rationale="Falling OI during a price move means traders are "
+                          "taking profits, not adding. The move lacks fresh capital "
+                          "and is vulnerable to reversal when profit-taking exhausts.",
+        discovery_type=DiscoveryType.TACTICAL,
+        inputs=["close", "sma20", "sum_open_interest", "oi_ma_20"],
+        effect_summary={
+            "BTCUSDT": {"horizon": 5, "mean_bp": 8.0, "p_value": 0.03, "best_regime": "neutral"},
+        },
+    ),
+
+    "M004": Mechanism(
+        mechanism_id="M004",
+        name="Funding Rotation",
+        description="When funding rates diverge significantly between BTC and ETH, "
+                    "capital rotates toward the cheaper asset. The spread mean-reverts "
+                    "within 50-100 bars.",
+        economic_rationale="Perpetual swap funding creates structural arbitrage "
+                          "pressure. When one asset becomes significantly more "
+                          "expensive to hold long, traders rotate to the cheaper one.",
+        discovery_type=DiscoveryType.STRUCTURAL,
+        inputs=["funding_rate", "funding_spread_btc_eth"],
+        effect_summary={
+            "BTCUSDT": {"horizon": 10, "mean_bp": 10.0, "p_value": 0.04, "best_regime": "any"},
+        },
+    ),
+
+    "M005": Mechanism(
+        mechanism_id="M005",
+        name="Volatility Compression → Expansion",
+        description="Periods of abnormally low volatility (compression) are "
+                    "followed by volatility expansion. The direction of expansion "
+                    "is predictable from the preceding trend.",
+        economic_rationale="Volatility is mean-reverting. Market participants "
+                          "accumulate positions during quiet periods; when a "
+                          "catalyst arrives, pent-up demand/supply releases "
+                          "directionally.",
+        discovery_type=DiscoveryType.TACTICAL,
+        inputs=["atr14", "atr_ma20", "close", "high", "low"],
+        effect_summary={
+            "SOLUSDT": {"horizon": 10, "mean_bp": 9.0, "p_value": 0.06, "best_regime": "low_vol"},
+            "BTCUSDT": {"horizon": 5, "mean_bp": 2.0, "p_value": 0.30, "best_regime": "low_vol"},
+        },
+    ),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Registry
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MechanismRegistry:
+    """Central registry of all validated market mechanisms."""
+
+    STORAGE_PATH = Path("data/experiments/mechanism_registry.json")
+
+    def __init__(self):
+        self._mechanisms: Dict[str, Mechanism] = {}
+        self._load_builtins()
+
+    def _load_builtins(self):
+        """Load pre-defined mechanisms. Load saved state from disk if exists."""
+        # Start with builtins
+        self._mechanisms.update(BUILTIN_MECHANISMS)
+        # Overlay any saved state
+        if self.STORAGE_PATH.exists():
+            try:
+                with open(self.STORAGE_PATH) as f:
+                    saved = json.load(f)
+                for mid, data in saved.items():
+                    if mid in self._mechanisms:
+                        # Update mutable fields
+                        m = self._mechanisms[mid]
+                        m.effect_summary = data.get("effect_summary", m.effect_summary)
+                        m.boundaries = [
+                            MechanismBoundary(**b) for b in data.get("boundaries", [])
+                        ] or m.boundaries
+                        m.used_by_hypotheses = data.get("used_by_hypotheses", m.used_by_hypotheses)
+                        # Load confidence components
+                        m.n_assets_tested = data.get("n_assets_tested", m.n_assets_tested)
+                        m.n_regimes_tested = data.get("n_regimes_tested", m.n_regimes_tested)
+                        m.n_years_data = data.get("n_years_data", m.n_years_data)
+                        m.walk_forward_passed = data.get("walk_forward_passed", m.walk_forward_passed)
+                        m.n_replications = data.get("n_replications", m.n_replications)
+                        if data.get("stability"):
+                            m.stability = StabilityMetrics(**data["stability"])
+                logger.info("Mechanism registry loaded from disk (%d mechanisms)", len(saved))
+            except Exception as e:
+                logger.warning("Failed to load mechanism registry: %s", e)
+
+    def save(self):
+        """Persist current state to disk."""
+        data = {}
+        for mid, m in self._mechanisms.items():
+            entry = {
+                "mechanism_id": m.mechanism_id,
+                "effect_summary": m.effect_summary,
+                "boundaries": [asdict(b) for b in m.boundaries],
+                "used_by_hypotheses": m.used_by_hypotheses,
+            }
+            if m.stability:
+                entry["stability"] = asdict(m.stability)
+            data[mid] = entry
+        self.STORAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.STORAGE_PATH, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        logger.info("Mechanism registry saved (%d mechanisms)", len(data))
+
+    def get(self, mechanism_id: str) -> Optional[Mechanism]:
+        return self._mechanisms.get(mechanism_id)
+
+    def list_all(self) -> List[Mechanism]:
+        return list(self._mechanisms.values())
+
+    def list_by_type(self, dtype: DiscoveryType) -> List[Mechanism]:
+        return [m for m in self._mechanisms.values() if m.discovery_type == dtype]
+
+    def register(self, mechanism: Mechanism):
+        """Register a new or updated mechanism."""
+        mechanism.updated_at = datetime.now(timezone.utc).isoformat()
+        self._mechanisms[mechanism.mechanism_id] = mechanism
+
+    def rank_by_effect(self) -> List[Tuple[Mechanism, float]]:
+        """Return mechanisms ranked by effect-size score (descending)."""
+        ranked = [(m, m.effect_size_rank()) for m in self._mechanisms.values()]
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return ranked
+
+    def link_hypothesis(self, mechanism_id: str, hypothesis_id: str):
+        """Record that a hypothesis uses this mechanism."""
+        m = self._mechanisms.get(mechanism_id)
+        if m and hypothesis_id not in m.used_by_hypotheses:
+            m.used_by_hypotheses.append(hypothesis_id)
+
+    def find_boundary(
+        self,
+        mechanism_id: str,
+        symbol: str,
+        timeframe: str,
+        condition_col: str,
+        n_splits: int = 5,
+    ) -> List[MechanismBoundary]:
+        """
+        Discover where a mechanism stops working by splitting events on a condition.
+
+        Example:
+            boundary = registry.find_boundary("M001", "BTCUSDT", "15m", "atr_percentile")
+            # Returns: effect is positive below 40th ATR percentile, negative above
+        """
+        from src.validation.event_study import EventStudy
+
+        m = self._mechanisms.get(mechanism_id)
+        if m is None or m.trigger_fn is None:
+            raise ValueError(f"Mechanism {mechanism_id} not found or has no trigger_fn")
+
+        study = EventStudy(symbol, timeframe, max_bars=50000)
+        study.add_trigger(mechanism_id, m.trigger_fn)
+
+        # Get events
+        df = study.load_data()
+        df = study.compute_features(df)
+        trigger_mask = m.trigger_fn(df) if m.trigger_fn else pd.Series(False, index=df.index)
+        events = study._find_events(trigger_mask)
+
+        if condition_col not in df.columns:
+            raise ValueError(f"Column {condition_col} not in features. Available: {list(df.columns)}")
+
+        # Split events by condition quantiles
+        condition_vals = df[condition_col].iloc[events].dropna()
+        if len(condition_vals) < 20:
+            return []
+
+        quantiles = np.linspace(0, 1, n_splits + 1)
+        boundaries = []
+        best_h = max(m.effect_summary.get(symbol, {}).get("horizon", 5), 1)
+
+        for i in range(n_splits):
+            low = condition_vals.quantile(quantiles[i])
+            high = condition_vals.quantile(quantiles[i + 1])
+            inside = [e for e in events
+                      if e < len(df) and low <= df[condition_col].iloc[e] <= high]
+            outside = [e for e in events
+                       if e < len(df) and (df[condition_col].iloc[e] < low or df[condition_col].iloc[e] > high)]
+
+            if len(inside) < 5:
+                continue
+
+            inside_rets = study._compute_forward_returns(inside, best_h)
+            _, p_val = study._t_test(inside_rets)
+            mean_bp = float(np.mean(inside_rets)) * 10000
+
+            boundaries.append(MechanismBoundary(
+                condition=f"{condition_col} in [{low:.2f}, {high:.2f}]",
+                effect_size_bp=mean_bp,
+                events_inside=len(inside),
+                events_outside=len(outside),
+                p_value=p_val,
+            ))
+
+        # Store on mechanism
+        m.boundaries = boundaries
+        return boundaries
+
+    def compute_stability(
+        self,
+        mechanism_id: str,
+        symbol: str,
+        timeframe: str,
+        window_bars: int = 5000,
+    ) -> StabilityMetrics:
+        """
+        Compute rolling-window stability of a mechanism's effect.
+
+        Returns StabilityMetrics with rolling Sharpe, mean bp, and persistence.
+        """
+        from src.validation.event_study import EventStudy
+
+        m = self._mechanisms.get(mechanism_id)
+        if m is None or m.trigger_fn is None:
+            raise ValueError(f"Mechanism {mechanism_id} not found or has no trigger_fn")
+
+        df = EventStudy(symbol, timeframe).load_data()
+        df = EventStudy(symbol, timeframe).compute_features(df)
+        best_h = max(m.effect_summary.get(symbol, {}).get("horizon", 5), 1)
+
+        n_bars = len(df)
+        step = window_bars // 2
+        rolling_means = []
+        rolling_sharpes = []
+
+        for start in range(0, n_bars - window_bars, step):
+            window_df = df.iloc[start:start + window_bars]
+            trigger_mask = m.trigger_fn(window_df)
+            study_temp = EventStudy(symbol, timeframe, max_bars=window_bars)
+            events = study_temp._find_events(trigger_mask)
+            if len(events) < 5:
+                continue
+            rets = study_temp._compute_forward_returns(events, best_h)
+            mean_bp = float(np.mean(rets)) * 10000
+            std_bp = float(np.std(rets, ddof=1)) * 10000
+            rolling_means.append(mean_bp)
+            rolling_sharpes.append(mean_bp / std_bp if std_bp > 0 else 0.0)
+
+        # Effect persistence: autocorrelation of rolling means
+        persistence = 0.0
+        if len(rolling_means) > 2:
+            arr = np.array(rolling_means)
+            persistence = float(np.corrcoef(arr[:-1], arr[1:])[0, 1])
+            if np.isnan(persistence):
+                persistence = 0.0
+
+        # Bootstrap variance of the effect
+        all_rets_full = []
+        for start in range(0, n_bars - window_bars, step):
+            window_df = df.iloc[start:start + window_bars]
+            trigger_mask = m.trigger_fn(window_df)
+            study_temp = EventStudy(symbol, timeframe, max_bars=window_bars)
+            events = study_temp._find_events(trigger_mask)
+            if len(events) >= 5:
+                rets = study_temp._compute_forward_returns(events, best_h)
+                all_rets_full.append(float(np.mean(rets)))
+
+        boot_var = float(np.var(all_rets_full)) if len(all_rets_full) > 1 else 0.0
+
+        stability = StabilityMetrics(
+            rolling_6m_mean_bp=rolling_means,
+            rolling_6m_sharpe=rolling_sharpes,
+            bootstrap_variance=boot_var,
+            effect_persistence=persistence,
+        )
+        m.stability = stability
+        return stability
+
+    def rank_by_confidence(self) -> List[Tuple[Mechanism, float]]:
+        """Return mechanisms ranked by composite confidence score."""
+        ranked = [(m, m.confidence_score()) for m in self._mechanisms.values()]
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return ranked
+
+    def research_cost_optimize(self, n_suggestions: int = 10) -> List[Dict]:
+        """
+        Prioritize experiments by expected information gain per unit cost.
+
+        Each potential experiment is scored by:
+          info_gain = (1.0 - mechanism.confidence) × n_assets × n_regimes
+          cost      = n_bars / 1000 + data_loading_penalty
+          priority  = info_gain / cost
+
+        Returns ranked list of suggested next experiments.
+        """
+        from src.core.causal_graph import causal_graph
+
+        suggestions = causal_graph.suggest_hypotheses(max_suggestions=50)
+        scored = []
+
+        for s in suggestions:
+            mechanism_ids = s["mechanisms"]
+            # Aggregate confidence of involved mechanisms
+            avg_confidence = 0.0
+            for mid in mechanism_ids:
+                m = self._mechanisms.get(mid.lstrip("M0").lstrip("M"))
+                # Try exact match first, then prefix
+                if m:
+                    avg_confidence += m.confidence_score()
+                else:
+                    for full_mid in self._mechanisms:
+                        if mid in full_mid:
+                            avg_confidence += self._mechanisms[full_mid].confidence_score()
+                            break
+                    else:
+                        avg_confidence += 0.3  # Unknown mechanism
+            avg_confidence /= max(len(mechanism_ids), 1)
+
+            # Information gain: how much uncertainty remains
+            info_gain = (1.0 - avg_confidence) * len(mechanism_ids)
+
+            # Cost estimate
+            n_assets = max(len(mechanism_ids), 2)
+            cost = 5000 / 1000 + (0.5 if n_assets > 2 else 0.0)
+
+            priority = info_gain / max(cost, 0.1)
+            scored.append({**s, "info_gain": round(info_gain, 3),
+                          "est_cost": round(cost, 2),
+                          "priority": round(priority, 4)})
+
+        scored.sort(key=lambda x: x["priority"], reverse=True)
+        return scored[:n_suggestions]
+
+# Singleton
+registry = MechanismRegistry()

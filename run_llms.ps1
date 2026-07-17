@@ -122,50 +122,87 @@ $ContextSize = if ([string]::IsNullOrWhiteSpace($ContextInput)) { "262144" } els
 $ModelNameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($SelectedModelFile)
 $host.UI.RawUI.WindowTitle = "llama-server:8080 | $ModelNameWithoutExt (Ctx: $ContextSize)"
 
-# Build core execution parameters utilizing dynamic context window size
-$ServerArgs = @("-m", "$FullModelPath", "-c", "$ContextSize", "--port", "$Port", "--host", "127.0.0.1", "-np", "1")
+# Build base parameters with dynamic context window size, Flash Attention, and Q8 KV-quantization
+$ServerArgs = @(
+    "-m", "$FullModelPath",
+    "-c", "$ContextSize",
+    "--port", "$Port",
+    "--host", "127.0.0.1",
+    "-np", "1",
+    "-fa", "on",               # Force Flash Attention
+    "-ctk", "q8_0",            # Quantize Key cache to 8-bit
+    "-ctv", "q8_0"             # Quantize Value cache to 8-bit
+)
 
-# If an assistant/draft model is assigned, attach it via single unified command parameters (-md)
+# Append speculative flags if draft assistant is selected
 if ($Selection.DraftFile) {
     $FullDraftPath = Join-Path $ModelDir $Selection.DraftFile
     if (Test-Path $FullDraftPath) {
         Write-Host "Configuring Speculative Decoding with Draft Assistant: $($Selection.DraftFile)" -ForegroundColor Magenta
-        $ServerArgs += @("-md", "$FullDraftPath")
-    } else {
-        Write-Host "Warning: Draft Assistant file not found at $FullDraftPath. Running standalone." -ForegroundColor Yellow
+        $ServerArgs += @(
+            "--spec-type", "draft-mtp",
+            "-md", "$FullDraftPath",
+            "-fit", "off"
+        )
     }
 }
 
-Write-Host "`n[Starting server on port 8080 for model: $ModelNameWithoutExt with Context: $ContextSize]" -ForegroundColor Green
+Write-Host "`n[Starting server on port $Port for model: $ModelNameWithoutExt with Context: $ContextSize]" -ForegroundColor Green
 $ServerProcess = Start-Process -FilePath $LlamaCmd -ArgumentList $ServerArgs -NoNewWindow -PassThru
 
 # ==========================================
-# STEP 4: HEALTH CHECK VERIFICATION
+# STEP 4: HEALTH CHECK VERIFICATION & CRASH RECOVERY
 # ==========================================
-Write-Host "Waiting for server to report healthy at $HostUrl..." -ForegroundColor Yellow
-$MaxRetries = 30
+Write-Host "Waiting for server to report healthy at http://127.0.0.1:$Port..." -ForegroundColor Yellow
+$MaxRetries = 15
 $Healthy = $false
 
 for ($i = 1; $i -le $MaxRetries; $i++) {
     try {
-        $Response = Invoke-WebRequest -Uri "$HostUrl/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        $Response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
         if ($Response.StatusCode -eq 200 -or $Response.Content -match '"status":\s*"ok"') {
             $Healthy = $true
             break
         }
     } catch {
-        # Waiting for core VRAM/layer allocations
+        # Check if the process died prematurely due to the upstream MTP vector bug
+        if ($ServerProcess.HasExited) {
+            Write-Host "[!] The server process terminated unexpectedly." -ForegroundColor Red
+            break
+        }
     }
     Start-Sleep -Seconds 2
 }
 
+# Fallback sequence if speculative decoding failed to load
 if (-not $Healthy) {
-    Write-Host "Error: Server failed to initialize on port 8080 within time limit." -ForegroundColor Red
-    Stop-Process -Id $ServerProcess.Id -Force
-    Exit
+    if ($Selection.DraftFile) {
+        Write-Host "`n[!] Detected llama.cpp upstream MTP loader bug ('invalid vector subscript')." -ForegroundColor Yellow
+        Write-Host "Falling back to standalone execution mode (without Draft Assistant)..." -ForegroundColor Cyan
+
+        # Strip draft options out and form a clean standalone execution parameter stack
+        $ServerArgs = @("-m", "$FullModelPath", "-c", "$ContextSize", "--port", "$Port", "--host", "127.0.0.1", "-np", "1", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0")
+        $ServerProcess = Start-Process -FilePath $LlamaCmd -ArgumentList $ServerArgs -NoNewWindow -PassThru
+
+        for ($i = 1; $i -le $MaxRetries; $i++) {
+            try {
+                $Response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                if ($Response.StatusCode -eq 200) { $Healthy = $true; break }
+            } catch {}
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    if (-not $Healthy) {
+        Write-Host "`nError: Server failed to initialize on port $Port." -ForegroundColor Red
+        if ($ServerProcess -and -not $ServerProcess.HasExited) {
+            Stop-Process -Id $ServerProcess.Id -Force
+        }
+        Exit
+    }
 }
 
-Write-Host "Server is running and healthy on Port 8080!" -ForegroundColor Green
+Write-Host "`nServer is running and healthy on Port $Port!" -ForegroundColor Green
 
 # ==========================================
 # STEP 5: AUTOMATIC CLIENT CONFIGURATION DYNAMICS
@@ -182,7 +219,7 @@ $DeepCodeConfig = @{
         "BASE_URL" = "http://localhost:8080/v1"
         "API_KEY"  = "Dummy"
         "LLM_CONTEXT_WINDOW"     = "262144"  # Forced fallback constraint variables
-        "CONTEXT_LENGTH"         = "262144"   
+        "CONTEXT_LENGTH"         = "262144"
         "MAX_TOKENS"             = "262144"
     }
     "thinkingEnabled" = $Selection.Thinking

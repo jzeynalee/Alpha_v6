@@ -1,144 +1,140 @@
 # Research Roadmap
 
 > **Sequential priorities. Prevents drifting into random experimentation.**
-> Each phase gates the next. Do not advance until the current phase is complete.
+> **Updated 2026-07-14 — reflects current evidence ladder state.**
 
 ---
 
-## Now → Get ONE Hypothesis to Production
+## Phase Now (COMPLETED → BLOCKED)
 
-**Objective**: Push a single hypothesis through all 10 pipeline stages. Validate the execution infrastructure end-to-end. Deploy minimal capital ($100–200) to confirm the live pipeline works.
+**Objective**: Push `btc_mr_l2` to production. **Result: FAILED.**
 
-**Candidate**: `btc_mr_l2` (BTC Mean-Reversion, already at L2)
+- [x] ADX regime filter added to BTC MR (`src/features/mean_reversion_signals.py`)
+- [x] Tested through Stage 7 — PF=0.428 on 10k bars, DSR=-6.17
+- [x] Confirmed D009/NEG002/NEG010: BTC MR is not viable on 15m
+- [ ] No hypothesis reached L5/L6
 
-### Steps
-1. Add MTF regime filter to BTC MR (only trade during neutral/range-bound HTF)
-2. Run Stages 2–6 via ExperimentManager
-3. If L3 (walk-forward) passes → run Stages 7–8
-4. If L4 (cross-asset) passes → start Stage 9 paper trading
-5. After 60–90 days paper trading with PF > 1.0 → Stage 10 production gate
-6. Deploy ≤$200 to validate execution
-
-### Success Criteria
-- One hypothesis at L5 or L6
-- Production pipeline validated end-to-end
-- Live execution matches paper trading results within 20%
+**Decision**: Pivot to best available strategy. `eth_mom_l1` (PF=1.71, L4) is the top candidate but fails walk-forward (DSR=-11.69). `pos_004` (PF=1.11, L3) is the most stable. `pos_002` (PF=1.08, L3) is the most active.
 
 ---
 
-## Next → Program A: Open Interest + Funding (★★★Highest Value)
+## Now → Program A: Open Interest + Funding (★★★★★ IN PROGRESS)
 
-**Prerequisite**: Production pipeline validated (Phase Now complete)
+**Status**: Data pipeline built, 6/18 hypotheses tested, 2 positive (PF>1.0).
 
-**Objective**: Build the richest structural information source beyond price. OI + funding data is already being collected.
+### Completed
+- [x] OI data pipeline: `src/features/positioning_enricher.py` — 366K rows, 5-min OI resampled to 15m
+- [x] Funding data pipeline: 7K rows, 8h funding forward-filled to 15m
+- [x] OI features: OI delta, OI percentile, OI z-score, OI/MA ratio
+- [x] Funding features: funding z-score, funding acceleration, funding percentile
+- [x] 6 signal functions in `src/features/positioning_signals.py`
+- [x] Column preservation patch in `src/backtest/data.py`
 
-### Priority Hypotheses
-| ID | Hypothesis | Why First |
-|----|-----------|-----------|
-| oi_001 | OI Expansion Breakout | Simplest testable OI signal |
-| oi_002 | OI Divergence Reversal | Opposite of oi_001 — natural pair |
-| fund_001 | Funding Rate Acceleration | 2nd derivative as squeeze predictor |
-| fund_004 | Funding Rate Percentile | Extreme funding mean-reversion |
-| oif_001 | Crowding Score | Composite OI × funding signal |
+### Results
+| ID | Name | PF | Trades | Verdict |
+|----|------|-----|--------|---------|
+| `pos_004` | Funding Cross-Asset Divergence | **1.11** | 42 | **PROMISING** — L3, Sharpe=0.89 |
+| `pos_002` | OI Divergence Reversal | **1.08** | 96 | **PROMISING** — L3, most active |
+| `pos_003` | Funding Rate Acceleration | 0.71 | 27 | REJECTED |
+| `pos_005` | Liquidation Cascade Detector | 0.66 | 9 | REJECTED — too few trades |
+| `funding_div_l0` | Funding Divergence | 0.30 | 25 | REJECTED |
+| `pos_001` | OI Expansion Breakout | 0.12 | 11 | REJECTED |
 
-### Steps
-1. Verify OI data pipeline is current (`backfill_binance_OFD.py`)
-2. Build OI feature: OI percentile, OI velocity, OI/volume ratio
-3. Build funding feature: funding percentile, funding acceleration, funding divergence
-4. Run experiment batch on all 18 Program A hypotheses
-5. Extract discoveries + negative knowledge
+### Remaining Program A hypotheses (not in evidence ladder)
+| ID | Hypothesis | Priority |
+|----|-----------|----------|
+| `oi_003` | OI Collapse Before Reversal | High |
+| `oi_004` | OI Velocity (2nd derivative) | High |
+| `oi_005` | OI Percentile Regime | Medium |
+| `oi_006` | OI vs Volume Ratio | Medium |
+| `oi_007` | OI Expansion Rate | Medium |
+| `fund_001` | Funding Rate Acceleration | Medium |
+| `fund_003` | Funding Rate Persistence | Low |
+| `fund_004` | Funding Rate Percentile | Low |
+| `fund_005` | Funding Velocity | Low |
+| `fund_006` | Cross-Exchange Funding Divergence | Low |
+| `fund_007` | Funding + OI Interaction | Medium |
+| `oif_001` | Crowding Score (OI×funding) | High |
+| `oif_002` | Positioning Cost Index | Medium |
+| `oif_003` | OI Expansion + Funding Convergence | Medium |
+| `oif_004` | OI Contraction + Funding Divergence | Medium |
 
 ---
 
-## Next → Program B: Cross-Sectional Momentum (★★★Highest Value)
+## Now → Program C: Volatility Expansion (★★★ COMPLETED)
 
-**Prerequisite**: Program A experiments complete, OI/funding data pipeline stable
+**Status**: All 4 hypotheses tested with distinct signals. Ghost Clone bug fixed.
 
-**Objective**: Largest remaining opportunity for scalable alpha. Requires expanding data universe to 30+ assets.
+| ID | Name | PF (SOL) | PF (BTC) | Verdict |
+|----|------|----------|----------|---------|
+| `exp_001` | ATR Compression Breakout | **1.09** | 0.71 | **PROMISING on SOL** |
+| `exp_002` | BB Squeeze + Entropy | 0.07 | 0.71 | REJECTED — NEG008 |
+| `exp_003` | Fractal Dimension Regime | 0.00 | 0.71 | REJECTED — 0 trades |
+| `vol_comp_l0` | Volatility Compression | 0.71 | 0.71 | REJECTED |
 
-### Priority Hypotheses
-| ID | Hypothesis | Why First |
-|----|-----------|-----------|
-| cs_001 | Cross-Sectional Relative Strength | Classic factor — test persistence |
-| cs_003 | Market Breadth Indicator | Simple, high signal-to-noise |
-| cs_009 | BTC Dominance Effect | Already partially validated |
+**Key finding**: SOL outperforms BTC for expansion (D015). Need 30k+ bar validation for exp_001 on SOL.
+
+---
+
+## Next → Program B: Cross-Sectional Momentum (★★★ NOT STARTED)
+
+**Prerequisite**: Program A complete. Requires 30+ asset data universe.
 
 ### Steps
 1. Expand data collection to 30+ assets (prioritize top-50 by volume)
 2. Build cross-sectional ranking engine
-3. Run experiment batch on all 30 Program B hypotheses
-4. Test sector rotation patterns
+3. Implement signal functions for cs_001-004
+4. Run experiment batch
 5. Extract discoveries
 
 ---
 
-## Next → Program C: Volatility Expansion (★★★★High)
+## Next → Ensemble Alpha (★★★ IN PROGRESS)
 
-**Prerequisite**: Program A + B experiments generating results
+**Status**: Infrastructure complete. 2 hypotheses in evidence ladder. Sub-strategy signals pre-computed.
 
-### Priority Hypotheses
-| ID | Hypothesis |
-|----|-----------|
-| exp_001 | ATR Compression Breakout |
-| exp_003 | Fractal Dimension Regime Switch |
+| ID | Name | PF | Trades | Verdict |
+|----|------|-----|--------|---------|
+| `ensemble_001` | Regime-Adaptive | 0.71 | 87 | NEEDS DYNAMIC WEIGHTING |
+| `ensemble_002` | Equal-Weight Blend | 0.57 | 71 | REJECTED — NEG011 |
 
-**Note**: This program is sample-starved. Need longer volatility history before drawing strong conclusions.
-
----
-
-## Next → Program D: Liquidations (★★★★High)
-
-**Prerequisite**: Liquidation data feed integrated (Hyblock / CoinGlass / Binance)
-
-### Priority Hypotheses
-| ID | Hypothesis |
-|----|-----------|
-| liq_001 | Liquidation Cluster Bounce |
-| liq_002 | Long Squeeze Detector |
+### Next Steps for Ensemble
+1. Implement rolling-Sharpe-weighted allocation (dynamic, not fixed)
+2. Add meta-labeling filter to reject weak ensemble signals
+3. Test with improved sub-strategies (eth_mom_l1 + pos_004 only)
 
 ---
 
-## Next → Program E: Market Microstructure (★★★★High)
+## Later → Programs D–J (BLOCKED)
 
-**Prerequisite**: Order book data pipeline operational
-
-### Priority Hypotheses
-| ID | Hypothesis |
-|----|-----------|
-| micro_001 | LOB Imbalance Signal |
-| micro_002 | CVD Divergence |
-
----
-
-## Later → Programs F–J
-
-| Program | Priority | Start After |
-|---------|----------|------------|
-| F: Multi-Timeframe Context | Medium | OI + cross-sectional data mature |
-| G: Relative Value | Medium | Cross-sectional infrastructure ready |
-| H: Machine Learning | Low-Medium | Feature library populated (200+ features) |
-| I: Portfolio Construction | Low | Multiple L4+ alpha streams exist |
-| J: Execution Research | Low | Production deployment imminent |
+| Program | Blocker |
+|---------|---------|
+| D: Liquidations | No liquidation data feed |
+| E: Microstructure | No order book data |
+| F: Multi-Timeframe | OI + cross-sectional not mature |
+| G: Relative Value | Cross-sectional infrastructure needed |
+| H: Machine Learning | Feature library not populated |
+| I: Portfolio Construction | Need multiple L4+ streams |
+| J: Execution Research | No production deployment |
 
 ---
 
 ## Discovery Extraction Cadence
 
-After every batch of experiments:
-
-1. **Generate research papers** → auto-generated by ExperimentManager
-2. **Extract discoveries** → add to DISCOVERIES.md with confidence level
-3. **Record negative knowledge** → add to NEG section of DISCOVERIES.md
-4. **Update knowledge graph** → add edges linking discoveries to hypotheses
-5. **Update this roadmap** → adjust priorities based on new evidence
+Updated 2026-07-14:
+1. [x] 15 research papers generated → `docs/research/*_20260714.md`
+2. [x] 7 new discoveries added → D011–D017 in DISCOVERIES.md
+3. [x] 5 new negative knowledge entries → NEG007–NEG011
+4. [ ] Update knowledge graph
+5. [x] Roadmap updated (this file)
 
 ---
 
 ## Guiding Principles
 
-1. **ONE hypothesis to production first** — validate the pipeline before scaling research
-2. **Highest expected value programs first** — OI/Funding > Cross-sectional > Volatility > Microstructure
-3. **Don't advance until current phase is complete** — no skipping ahead
-4. **Every experiment produces a paper** — no orphaned results
-5. **Negative results are discoveries too** — failed hypotheses prevent repeated dead-ends
-6. **The Knowledge Graph grows with every experiment** — relationships compound
+1. **Highest expected value programs first** — OI/Funding > Cross-sectional > Volatility > Microstructure
+2. **Don't advance until current phase is complete** — Program A still has 12 untested hypotheses
+3. **Every experiment produces a paper** — 15 papers in `docs/research/`
+4. **Negative results are discoveries too** — 11 NEG entries prevent repeated dead-ends
+5. **The Knowledge Graph grows with every experiment** — needs update
+6. **SOL-first for expansion, BTC for OI/funding** — asset specialization confirmed

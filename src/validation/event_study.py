@@ -132,6 +132,7 @@ class EventStudy:
         high = df["high"]
         low = df["low"]
         volume = df["volume"]
+        log_close = np.log(close)
 
         # Z-score
         df["sma20"] = close.rolling(20).mean()
@@ -143,10 +144,10 @@ class EventStudy:
         df["std100"] = close.rolling(100).std()
         df["z_score_100"] = (close - df["sma100"]) / df["std100"].clip(lower=1e-9)
 
-        # Returns
-        df["ret_1"] = close.pct_change(1)
-        df["ret_5"] = close.pct_change(5)
-        df["ret_20"] = close.pct_change(20)
+        # Log returns (additive, symmetric, better for statistical tests)
+        df["log_ret_1"] = log_close.diff(1)
+        df["log_ret_5"] = log_close.diff(5)
+        df["log_ret_20"] = log_close.diff(20)
 
         # Regime: Trend (ADX approximation via SMA slopes)
         df["sma50"] = close.rolling(50).mean()
@@ -155,14 +156,14 @@ class EventStudy:
         df.loc[df["trend_strength"] > 0.02, "regime_trend"] = "bull"
         df.loc[df["trend_strength"] < -0.02, "regime_trend"] = "bear"
 
-        # Regime: Volatility (ATR percentile)
+        # Regime: Volatility — wider anchor window (1000 bars ≈ 10 days 15m)
         tr = pd.concat([
             high - low,
             (high - close.shift(1)).abs(),
             (low - close.shift(1)).abs(),
         ], axis=1).max(axis=1)
         atr14 = tr.rolling(14).mean()
-        df["atr_percentile"] = atr14.rolling(100).rank(pct=True)
+        df["atr_percentile"] = atr14.rolling(1000, min_periods=200).rank(pct=True)
         df["regime_vol"] = "medium"
         df.loc[df["atr_percentile"] > 0.67, "regime_vol"] = "high"
         df.loc[df["atr_percentile"] < 0.33, "regime_vol"] = "low"
@@ -177,12 +178,16 @@ class EventStudy:
 
     # ── Main execution ──────────────────────────────────────────────────────
 
-    def run(self) -> List[EventStudyResult]:
-        """Run event study for all registered triggers."""
+    def run(self, df: Optional[pd.DataFrame] = None) -> List[EventStudyResult]:
+        """Run event study for all registered triggers.
+        
+        Args:
+            df: Optional pre-loaded/enriched DataFrame. If None, loads via DatasetRegistry.
+        """
         if not self._triggers:
             raise ValueError("No triggers registered. Call add_trigger() first.")
 
-        self._df = self.load_data()
+        self._df = df if df is not None else self.load_data()
         self._df = self.compute_features(self._df)
         n_bars = len(self._df)
 
@@ -214,10 +219,11 @@ class EventStudy:
                 result.mean_return[h] = float(np.mean(fwd_rets))
                 result.median_return[h] = float(np.median(fwd_rets))
                 result.std_return[h] = float(np.std(fwd_rets, ddof=1))
+                # Win rate: fraction of events with positive log return
                 result.win_rate[h] = float(np.mean(fwd_rets > 0))
                 result.raw_returns[h] = fwd_rets
 
-                # Statistical tests
+                # Statistical tests (on log returns)
                 t_stat, t_pval = self._t_test(fwd_rets)
                 result.t_statistic[h] = float(t_stat)
                 result.t_pvalue[h] = float(t_pval)
@@ -229,16 +235,18 @@ class EventStudy:
                 perm_pval = self._permutation_test(fwd_rets, event_indices, h)
                 result.permutation_pvalue[h] = float(perm_pval)
 
-                # Significance check
+                # Significance: t-test significant AND CI does not contain zero
                 if t_pval < 0.05 and ci_low > 0:
                     result.significant_horizons.append(h)
 
                 logger.info(
-                    "  h=%2d: mean=%+.5f median=%+.5f std=%.4f win=%.1f%% "
-                    "t=%.2f p=%.3f CI=[%+.4f, %+.4f] perm_p=%.3f %s",
-                    h, result.mean_return[h], result.median_return[h],
-                    result.std_return[h], result.win_rate[h] * 100,
-                    t_stat, t_pval, ci_low, ci_high, perm_pval,
+                    "  h=%2d: mean=%+.1fbp median=%+.1fbp std=%.1fbp win=%.1f%% "
+                    "t=%.2f p=%.3f CI=[%+.1f, %+.1f]bp perm_p=%.3f %s",
+                    h,
+                    result.mean_return[h] * 10000, result.median_return[h] * 10000,
+                    result.std_return[h] * 10000, result.win_rate[h] * 100,
+                    t_stat, t_pval,
+                    ci_low * 10000, ci_high * 10000, perm_pval,
                     "★" if h in result.significant_horizons else "",
                 )
 
@@ -264,14 +272,13 @@ class EventStudy:
         return indices
 
     def _compute_forward_returns(self, event_indices: List[int], horizon: int) -> np.ndarray:
-        """Compute forward returns from event indices to horizon bars later."""
-        close = self._df["close"].values
-        returns = []
-        for idx in event_indices:
-            if idx + horizon < len(close):
-                ret = (close[idx + horizon] - close[idx]) / close[idx]
-                returns.append(ret)
-        return np.array(returns)
+        """Compute log forward returns: ln(P_{t+h} / P_t). Additive, symmetric, better for t-tests."""
+        log_close = np.log(self._df["close"].values)
+        n = len(log_close)
+        # Vectorized: pre-compute all forward log returns then index
+        fwd = np.full(n, np.nan)
+        fwd[: n - horizon] = log_close[horizon:] - log_close[: n - horizon]
+        return fwd[np.array(event_indices)]
 
     # ── Statistical tests ───────────────────────────────────────────────────
 
@@ -309,28 +316,41 @@ class EventStudy:
         ci_high = float(np.percentile(means, (1 - alpha / 2) * 100))
         return ci_low, ci_high
 
-    def _permutation_test(self, returns: np.ndarray, event_indices: List[int], horizon: int, n_perms: int = 2000) -> float:
-        """Permutation test: randomize event times, compare to observed mean."""
+    def _permutation_test(self, returns: np.ndarray, event_indices: List[int], horizon: int, n_perms: int = 2000, block_size: int = 20) -> float:
+        """Block-bootstrap permutation test preserving serial correlation.
+
+        Instead of randomizing individual bars (which destroys autocorrelation
+        structure and yields artificially low p-values), we use circular block
+        bootstrapping: shuffle contiguous blocks of `block_size` bars to
+        preserve the local serial correlation of financial returns.
+        """
         observed_mean = float(np.mean(returns))
-        close = self._df["close"].values
-        n_bars = len(close)
+        log_close = np.log(self._df["close"].values)
+        n_bars = len(log_close)
 
         rng = np.random.default_rng(42)
         perm_means = np.zeros(n_perms)
         n_events = len(event_indices)
+
         for p in range(n_perms):
-            # Random event times (avoiding overlap)
-            random_indices = rng.choice(
-                n_bars - horizon - 1, size=min(n_events, n_bars // self.min_bars_between_events), replace=False
-            )
+            # Circular block bootstrap: pick random block starts, wrap around
+            n_blocks = max(1, n_events // block_size + 1)
+            block_starts = rng.integers(0, n_bars - horizon - block_size, size=n_blocks)
+            perm_indices = []
+            for start in block_starts:
+                for offset in range(block_size):
+                    idx = (start + offset) % (n_bars - horizon - 1)
+                    perm_indices.append(idx)
+            perm_indices = perm_indices[:n_events]
+
+            # Vectorized log return computation
             perm_rets = []
-            for idx in random_indices:
+            for idx in perm_indices:
                 if idx + horizon < n_bars:
-                    perm_rets.append((close[idx + horizon] - close[idx]) / close[idx])
+                    perm_rets.append(log_close[idx + horizon] - log_close[idx])
             if perm_rets:
                 perm_means[p] = float(np.mean(perm_rets))
 
-        # One-sided: fraction of permutations with mean >= observed
         p_val = float(np.mean(perm_means >= observed_mean))
         return p_val
 
@@ -415,15 +435,15 @@ class EventStudy:
 
             lines.append("### Forward Returns by Horizon")
             lines.append("")
-            lines.append("| Horizon | Mean | Median | Std | Win Rate | t-stat | p-value | Bootstrap 95% CI | Perm p |")
-            lines.append("|---------|------|--------|-----|----------|--------|---------|-------------------|--------|")
+            lines.append("| Horizon | Mean (bp) | Median (bp) | Std (bp) | Win Rate | t-stat | p-value | Bootstrap 95% CI (bp) | Perm p |")
+            lines.append("|---------|-----------|-------------|----------|----------|--------|---------|-----------------------|--------|")
             for h in r.horizons:
                 sig = " ★" if h in r.significant_horizons else ""
                 lines.append(
-                    f"| {h:>2} bar{sig} | {r.mean_return.get(h, 0):+.5f} | {r.median_return.get(h, 0):+.5f} | "
-                    f"{r.std_return.get(h, 0):.4f} | {r.win_rate.get(h, 0):.1%} | "
+                    f"| {h:>2} bar{sig} | {r.mean_return.get(h, 0)*10000:+.1f} | {r.median_return.get(h, 0)*10000:+.1f} | "
+                    f"{r.std_return.get(h, 0)*10000:.1f} | {r.win_rate.get(h, 0):.1%} | "
                     f"{r.t_statistic.get(h, 0):+.2f} | {r.t_pvalue.get(h, 1):.4f} | "
-                    f"[{r.bootstrap_ci_lower.get(h, 0):+.4f}, {r.bootstrap_ci_upper.get(h, 0):+.4f}] | "
+                    f"[{r.bootstrap_ci_lower.get(h, 0)*10000:+.1f}, {r.bootstrap_ci_upper.get(h, 0)*10000:+.1f}] | "
                     f"{r.permutation_pvalue.get(h, 1):.4f} |"
                 )
             lines.append("")
@@ -447,7 +467,7 @@ class EventStudy:
                     for key in keys:
                         regime_name = key.split("=", 1)[1]
                         vals = " | ".join(
-                            f"{r.regime_results[key].get(h, float('nan')):+.5f}"
+                            f"{r.regime_results[key].get(h, float('nan'))*10000:+.1f}bp"
                             for h in r.horizons
                         )
                         lines.append(f"| {regime_name} | {vals} |")
@@ -477,3 +497,201 @@ class EventStudy:
                     best_p = p
                     best = r
         return best
+
+    # ── Effect-size-first ranking ──────────────────────────────────────────
+
+    def rank_by_effect(self) -> List[Tuple[EventStudyResult, int, float]]:
+        """
+        Rank results by economic effect size, not statistical significance.
+
+        Composite score = |mean_bp| × (1 - p_value)
+
+        Returns list of (result, horizon, score) sorted by score descending.
+        """
+        ranked = []
+        for r in self._results:
+            for h in r.horizons:
+                mean_bp = abs(r.mean_return.get(h, 0)) * 10000
+                p_val = r.t_pvalue.get(h, 1.0)
+                score = mean_bp * (1.0 - p_val)
+                ranked.append((r, h, score))
+        ranked.sort(key=lambda x: x[2], reverse=True)
+        return ranked
+
+    # ── Boundary discovery ─────────────────────────────────────────────────
+
+    def find_boundaries(
+        self,
+        trigger_name: str,
+        condition_col: str,
+        n_splits: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Discover where a trigger's predictive power stops working.
+
+        Splits events by condition_col quantiles and measures effect size
+        in each bin. Returns the boundary where effect crosses zero.
+
+        Example:
+            boundaries = study.find_boundaries("z_neg_2.5", "atr_percentile")
+            # Shows effect is positive in low ATR bins, negative in high ATR bins
+        """
+        if self._df is None or trigger_name not in self._triggers:
+            return []
+
+        trigger_fn = self._triggers[trigger_name]
+        trigger_mask = trigger_fn(self._df)
+        events = self._find_events(trigger_mask)
+
+        if len(events) < 20 or condition_col not in self._df.columns:
+            return []
+
+        condition_vals = self._df[condition_col].iloc[events].dropna()
+        quantiles = np.linspace(0, 1, n_splits + 1)
+        boundaries = []
+
+        for i in range(n_splits):
+            low = condition_vals.quantile(quantiles[i])
+            high = condition_vals.quantile(quantiles[i + 1])
+            inside = [e for e in events
+                      if e < len(self._df) and low <= self._df[condition_col].iloc[e] <= high]
+            if len(inside) < 5:
+                continue
+
+            row = {"bin": f"[{low:.2f}, {high:.2f}]", "n": len(inside)}
+            for h in [1, 3, 5, 10]:
+                rets = self._compute_forward_returns(inside, h)
+                row[f"h{h}_mean_bp"] = float(np.mean(rets)) * 10000
+                row[f"h{h}_win"] = float(np.mean(rets > 0))
+            boundaries.append(row)
+
+        return boundaries
+
+    # ── Interaction study ──────────────────────────────────────────────────
+
+    def interaction_study(
+        self,
+        trigger_name: str,
+        condition_a: str,
+        condition_b: str,
+    ) -> pd.DataFrame:
+        """
+        Test interaction between two conditions.
+
+        Splits events into 4 quadrants and measures effect size in each.
+        Reveals conditional relationships single-factor analysis misses.
+
+        Example:
+            df = study.interaction_study("z_neg_2.5", "atr_percentile", "vol_ratio")
+            # Shows: best effect in low-vol + normal-volume quadrant
+        """
+        if self._df is None or trigger_name not in self._triggers:
+            return pd.DataFrame()
+
+        trigger_fn = self._triggers[trigger_name]
+        trigger_mask = trigger_fn(self._df)
+        events = self._find_events(trigger_mask)
+
+        if len(events) < 20:
+            return pd.DataFrame()
+
+        # Split conditions at median
+        med_a = self._df[condition_a].dropna().median()
+        med_b = self._df[condition_b].dropna().median()
+
+        quadrants = {
+            f"{condition_a}<med & {condition_b}<med": [],
+            f"{condition_a}<med & {condition_b}>med": [],
+            f"{condition_a}>med & {condition_b}<med": [],
+            f"{condition_a}>med & {condition_b}>med": [],
+        }
+
+        for e in events:
+            if e >= len(self._df):
+                continue
+            a_val = self._df[condition_a].iloc[e]
+            b_val = self._df[condition_b].iloc[e]
+            if pd.isna(a_val) or pd.isna(b_val):
+                continue
+            key = f"{condition_a}{'<' if a_val < med_a else '>'}med & {condition_b}{'<' if b_val < med_b else '>'}med"
+            quadrants[key].append(e)
+
+        rows = []
+        for label, idxs in quadrants.items():
+            if len(idxs) < 5:
+                continue
+            row = {"quadrant": label, "n": len(idxs)}
+            for h in [1, 3, 5, 10]:
+                rets = self._compute_forward_returns(idxs, h)
+                row[f"h{h}_mean_bp"] = float(np.mean(rets)) * 10000
+                row[f"h{h}_win"] = float(np.mean(rets > 0))
+            rows.append(row)
+
+        return pd.DataFrame(rows)
+
+    # ── Stability analysis ─────────────────────────────────────────────────
+
+    def stability_analysis(
+        self,
+        trigger_name: str,
+        window_bars: int = 5000,
+    ) -> Dict[str, Any]:
+        """
+        Rolling-window stability of a mechanism's predictive power.
+
+        Returns:
+            rolling_means_bp: effect size per window
+            rolling_sharpes: Sharpe per window
+            effect_persistence: autocorrelation of rolling effect
+            bootstrap_variance: variance of the effect estimate
+        """
+        if self._df is None or trigger_name not in self._triggers:
+            return {}
+
+        trigger_fn = self._triggers[trigger_name]
+        n_bars = len(self._df)
+        step = window_bars // 2
+
+        rolling_means = []
+        rolling_sharpes = []
+        window_labels = []
+
+        for start in range(0, n_bars - window_bars, step):
+            window_df = self._df.iloc[start:start + window_bars]
+            trigger_mask = trigger_fn(window_df)
+            events = self._find_events(trigger_mask)
+
+            if len(events) < 5:
+                continue
+
+            # Use h=5 as default horizon
+            rets = self._compute_forward_returns(events, 5)
+            mean_bp = float(np.mean(rets)) * 10000
+            std_bp = float(np.std(rets, ddof=1)) * 10000
+            rolling_means.append(mean_bp)
+            rolling_sharpes.append(mean_bp / std_bp if std_bp > 0 else 0.0)
+
+            # Timestamp label
+            if "timestamp" in self._df.columns:
+                window_labels.append(str(self._df["timestamp"].iloc[start]))
+            else:
+                window_labels.append(str(start))
+
+        # Effect persistence
+        persistence = 0.0
+        if len(rolling_means) > 2:
+            arr = np.array(rolling_means)
+            persistence = float(np.corrcoef(arr[:-1], arr[1:])[0, 1])
+            if np.isnan(persistence):
+                persistence = 0.0
+
+        return {
+            "trigger": trigger_name,
+            "window_bars": window_bars,
+            "n_windows": len(rolling_means),
+            "rolling_means_bp": rolling_means,
+            "rolling_sharpes": rolling_sharpes,
+            "window_labels": window_labels,
+            "effect_persistence": persistence,
+            "bootstrap_variance": float(np.var(rolling_means)) if len(rolling_means) > 1 else 0.0,
+        }

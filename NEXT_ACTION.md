@@ -2,145 +2,179 @@
 
 > **For LLMs**: After reading PROJECT_STATE.md, read this file. It tells you exactly what to do.
 
-## Priority 1: Get ONE Hypothesis to Production
+---
 
-The immediate goal is NOT to build more infrastructure or invent more hypotheses.
+## The Methodology Shift (2026-07-16)
 
-It is to push **one hypothesis** through all 10 pipeline stages:
+**OLD**: Test complete trading strategies → measure Profit Factor → iterate blindly
 
-```
-Stage 1  ✓ Economic Explanation (33/33 passed)
-Stage 2  — In-Sample Discovery
-Stage 3  — Walk-Forward Validation
-Stage 4  — Bootstrap
-Stage 5  — Outlier Robustness
-Stage 6  — Transaction Costs
-Stage 7  — Regime Stability
-Stage 8  — Cross-Asset Validation
-Stage 9  — Paper Trading
-Stage 10 — Production Gate
-```
+**NEW**: Test market mechanisms first → build strategies second
 
-**Recommended candidate**: `btc_mr_l2` (BTC Mean-Reversion, already at L2)
-- Has economic rationale
-- Survived transaction costs in v5
-- Failed walk-forward — needs re-discovery with better regime filtering
-- BTC has deepest data, lowest costs, best execution quality
+**Why**: When a strategy fails, you need to know WHY. The event-study engine (`src/validation/event_study.py`) decomposes each hypothesis into sub-questions about the underlying mechanism before any trading rules are constructed.
 
-## Next Steps
+**Read**: `docs/methodology/event_study_method.md` for the full methodology.
 
-1. **Run In-Sample Discovery Experiment for `btc_mr_l2`**:
-   ```python
-   from src.core.experiment_manager import ExperimentManager
-   manager = ExperimentManager()
-   manager.run_single(hypothesis="btc_mr_l2", symbol="BTCUSDT", timeframe="15m")
-   ```
+---
 
-2. **Check the Status of the Experiment**:
-   ```bash
-   python scripts/show_status.py          # Pipeline summary
-   python scripts/show_evidence_scores.py # Multi-dimensional scores
-   ```
+## Priority 1: Apply Event-Study Methodology to Existing Hypotheses
 
-3. **Populate the Knowledge Base with the Experiment Results**:
-   ```python
-   from src.core.knowledge_base import knowledge_base, Observation
-   knowledge_base.add(Observation(
-       observation_id="obs_009",
-       statement="OI expansion + price breakout predicts continuation on 15m BTC",
-       domain="open_interest",
-       confidence=2,
-       supporting_experiments=["exp_pos_001_btc_15m"],
-       related_hypotheses=["pos_001"],
-   ))
-   ```
+Instead of running full strategy backtests, decompose each active hypothesis using the event-study framework:
 
-## Priority 2: Run Experiments on Program A (Open Interest + Funding)
+### Already Done
+- [x] `btc_mr_l2` — H01-H06 decomposed (see `docs/research/btc_mr_l2_decomposed_20260716.md`)
+  - Mechanism CONFIRMED but too weak for 15m trading (D017, D018)
+  - Next: test on 4h/1d where moves are larger relative to costs
 
-The highest-expected-value research program. Use the experiment manager:
+### Next Candidates (in priority order)
+
+#### 1. `pos_002` — OI Divergence Reversal (Highest Priority)
+This is the most active PositioningAlpha strategy (96 trades, PF=1.08). Decompose it:
 
 ```python
-from src.core.experiment_manager import ExperimentManager
-manager = ExperimentManager()
-manager.run_family("PositioningAlpha", symbol="BTCUSDT", timeframe="15m")
+from src.validation.event_study import EventStudy
+study = EventStudy("BTCUSDT", "15m", max_bars=50000)
+
+# H01: Does OI divergence predict reversal?
+study.add_trigger("oi_div_bearish",
+    lambda df: (df["close"] > df["sma20"]) & (df["sum_open_interest"] < df["oi_ma_20"]))
+study.add_trigger("oi_div_bullish", 
+    lambda df: (df["close"] < df["sma20"]) & (df["sum_open_interest"] > df["oi_ma_20"]))
+
+results = study.run()
 ```
 
-## Priority 3: Populate the Knowledge Base
+Key questions to answer:
+- Which horizon does the divergence predict? (1, 3, 5, 10 bars?)
+- Does it work better in trending or ranging regimes?
+- Is it stronger on BTC or ETH?
 
-Every time an experiment produces a finding, add it:
+#### 2. `pos_004` — Funding Cross-Asset Divergence
+Best Sharpe in PositioningAlpha (0.89). Decompose:
+- Does BTC-ETH funding spread predict convergence?
+- What spread threshold maximizes predictive power?
+- How long does convergence take?
+
+#### 3. `eth_mom_l1` — Multi-Factor Momentum
+Best overall PF (1.71). Decompose:
+- Which component drives the edge? (SMA crossover? ROC? Volume?)
+- Does the HTF regime filter actually improve signal quality?
+- At what horizon does momentum decay?
+
+#### 4. `exp_001` — ATR Compression Breakout (on SOL)
+D015 showed SOL outperforms BTC. Decompose:
+- At what ATR compression threshold does expansion become predictable?
+- Is volume confirmation necessary or redundant?
+- What is the optimal holding period?
+
+---
+
+## How to Run an Event Study
+
+```bash
+# Quick event study (interactive)
+python -c "
+from src.validation.event_study import EventStudy
+study = EventStudy('BTCUSDT', '15m', max_bars=50000)
+study.add_trigger('z_neg_2.5', lambda df: df['z_score'] < -2.5)
+results = study.run()
+print(study.report(results))
+"
+
+# Cross-asset validation
+python -c "
+from src.validation.event_study import EventStudy
+study = EventStudy('BTCUSDT', '15m', max_bars=50000)
+study.add_trigger('z_neg_2.5', lambda df: df['z_score'] < -2.5)
+ca = study.cross_asset('z_neg_2.5', ['ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'])
+for sym, vals in ca.items(): print(sym, vals)
+"
+```
+
+---
+
+## Priority 2: Higher-Timeframe MR Testing
+
+D017 showed Z-score MR exists but is too weak on 15m. Test on larger timeframes:
 
 ```python
-from src.core.knowledge_base import knowledge_base, Observation
-knowledge_base.add(Observation(
-    observation_id="obs_009",
-    statement="OI expansion + price breakout predicts continuation on 15m BTC",
-    domain="open_interest",
-    confidence=2,
-    supporting_experiments=["exp_pos_001_btc_15m"],
-    related_hypotheses=["pos_001"],
-))
+# 4-hour BTC
+study = EventStudy("BTCUSDT", "4h", max_bars=10000)
+study.add_trigger("z_neg_2.5_4h", lambda df: df["z_score"] < -2.5)
+results = study.run()
+
+# 1-day BTC
+study = EventStudy("BTCUSDT", "1d", max_bars=2000)
+study.add_trigger("z_neg_2.5_1d", lambda df: df["z_score"] < -2.5)
+results = study.run()
 ```
 
-## How to Run Experiments
+---
 
-### 1. Single Hypothesis
-```bash
-python -m src.experiments.run_single --hypothesis btc_mr_l2 --symbol BTCUSDT --timeframe 15m
+## Priority 3: Strategy Construction (Only After Mechanism Confirmed)
+
+Only build a complete trading strategy when the mechanism has been validated through the event-study framework. The strategy rules should be directly derived from the evidence:
+
+```
+Evidence:
+  - H01 confirmed: Z < -2.5 predicts +0.10% at h=10 in low vol
+  - H03 confirmed: Low vol regime required (ATR percentile < 33%)
+  - H04 confirmed: BTC, ETH, BNB only (not SOL)
+
+Strategy:
+  Entry:  Z < -2.5 AND ATR_percentile < 33%
+  Exit:   10 bars OR Z-score crosses above -1.0
+  Assets: BTCUSDT, ETHUSDT, BNBUSDT
+  Size:   Kelly 2% risk per trade
 ```
 
-### 2. Entire Family
-```bash
-python -m src.experiments.run_family --family PositioningAlpha
-```
-
-### 3. All L0 Hypotheses
-```bash
-python -m src.experiments.run_batch --level L0
-```
-
-## How to Check Status
-
-```bash
-python scripts/show_status.py          # Pipeline summary
-python scripts/show_evidence_scores.py # Multi-dimensional scores
-python scripts/show_knowledge_base.py  # KB findings
-```
+---
 
 ## What NOT to Do
 
-- ❌ Do NOT invent new hypotheses before running experiments on existing ones
-- ❌ Do NOT build more infrastructure before validating the pipeline end-to-end
+- ❌ Do NOT run strategy backtests without first validating the mechanism
+- ❌ Do NOT tune strategy parameters before understanding the mechanism
+- ❌ Do NOT test a complete strategy when you can test one question
+- ❌ Do NOT modify existing modules without running `pytest tests/` (171 tests)
 - ❌ Do NOT hard-code data paths — always use DatasetRegistry
-- ❌ Do NOT create standalone MD/PDF reports — record findings in Knowledge Base
-- ❌ Do NOT modify existing modules without running the full test suite
 
-## Current Blockers
-
-1. **Need OHLCV data**: Run `python scripts/backfill_binance_ohlcv.py` if data is stale
-2. **Need funding rate data**: Run `python scripts/backfill_binance_OFD.py` for Program A
+---
 
 ## File Map for LLMs
 
-| File | Purpose | When to Read |
-|------|---------|-------------|
-| `PROJECT_STATE.md` | Current status | First |
-| `NEXT_ACTION.md` | This file | Second |
-| `ARCHITECTURE.md` | System design | Third |
-| `docs/research/roadmap.md` | Full research roadmap | When planning |
-| `docs/research/thesis_catalog.md` | All 200+ hypotheses | When selecting experiments |
-| `docs/knowledge/observations.md` | What we know | Before designing tests |
-| `src/core/dataset_registry.py` | Data access | When loading data |
-| `src/core/experiment_manager.py` | Experiment runner | When running experiments |
-| `src/core/evidence_ladder.py` | Hypothesis tracking | When evaluating results |
+| # | File | Purpose | When to Read |
+|---|------|---------|-------------|
+| 1 | `PROJECT_STATE.md` | Current state | First |
+| 2 | `NEXT_ACTION.md` | This file | Second |
+| 3 | `ARCHITECTURE.md` | System design | Third |
+| 4 | `DISCOVERIES.md` | Validated findings + negative knowledge | Fourth |
+| 5 | `docs/methodology/event_study_method.md` | **Event-study methodology** | Fifth |
+| 6 | `docs/research/roadmap.md` | Research priorities | When planning |
+| 7 | `docs/research/thesis_catalog.md` | All 200+ hypotheses | When selecting |
+| 8 | `src/validation/event_study.py` | Event-study engine | When testing mechanisms |
+| 9 | `src/core/dataset_registry.py` | Data access | When loading data |
+| 10 | `src/core/evidence_ladder.py` | Hypothesis tracking | When evaluating |
 
+---
 
-## Key Documents
+## Quick Reference: Signal Implementation Files
 
-| # | File | Purpose |
-|---|------|---------|
-| 1 | `PROJECT_STATE.md` | Current state — read first |
-| 2 | `NEXT_ACTION.md` | Exact instructions — read second |
-| 3 | `ARCHITECTURE.md` | System design — read third |
-| 4 | `DISCOVERIES.md` | Validated findings + negative knowledge — read fourth |
-| 5 | `docs/research/roadmap.md` | **Sequential research priorities** — read fifth |
-| 6 | `docs/research/thesis_catalog.md` | All 200+ hypotheses |
+| Family | File | Hypotheses |
+|--------|------|------------|
+| MeanReversionAlpha | `src/features/mean_reversion_signals.py` | btc_mr_l2 |
+| MomentumAlpha | `src/features/momentum_signals.py` | eth_mom_l1, sol_mom_l1 |
+| ExpansionAlpha | `src/features/expansion_signals.py` | exp_001, exp_002, exp_003, vol_comp_l0 |
+| PositioningAlpha | `src/features/positioning_signals.py` | pos_001-005, funding_div_l0 |
+| PositioningAlpha | `src/features/positioning_enricher.py` | OI + funding data enrichment |
+| EnsembleAlpha | `src/features/ensemble_signals.py` | ensemble_001, ensemble_002 |
+| Evaluation | `scripts/evaluate_strategies.py` | Full pipeline evaluation |
+| Portfolio | `scripts/portfolio_backtest.py` | Multi-strategy backtest |
+
+---
+
+## Current State (2026-07-16)
+
+- **Evidence ladder**: 38 hypotheses, 19 validated discoveries, 11 negative knowledge entries
+- **Tested through pipeline**: 15 hypotheses (7 auto-testable + 6 Program A + 2 ensembles)
+- **Positive PF (>1.0)**: pos_004 (1.11), pos_002 (1.08), eth_mom_l1 (1.71), sol_mom_l1 (1.28), exp_001 on SOL (1.09)
+- **Mechanism-validated**: btc_mr_l2 (D017, D018 — confirmed but too weak for costs)
+- **Next**: Event studies on pos_002, pos_004, eth_mom_l1, exp_001
