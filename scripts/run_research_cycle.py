@@ -2,7 +2,7 @@
 """Run a single research cycle using the ExperimentScheduler.
 
 Usage:
-    python scripts/run_research_cycle.py [--budget N]
+    python scripts/run_research_cycle.py [--budget N] [--promote M002]
 """
 import argparse
 import sys
@@ -15,16 +15,23 @@ from src.core.experiment_scheduler import ExperimentScheduler
 def main():
     parser = argparse.ArgumentParser(description="Run automated research cycle")
     parser.add_argument("--budget", "-b", type=int, default=3, help="Number of experiments per cycle")
+    parser.add_argument("--promote", type=str, default=None,
+                        help="Run advancement checks for the given mechanism ID (e.g. M002)")
     args = parser.parse_args()
 
     scheduler = ExperimentScheduler()
-    scheduler.generate_candidates()
-    results = scheduler.run_cycle(budget=args.budget)
 
-    for r in results:
-        print(f"  {r['mechanism_id']:6s} {r['symbol']:8s} {r['timeframe']:4s} -> {r['status']:10s} {r.get('result_summary', '')}")
+    if args.promote:
+        print(f"Advancing mechanism {args.promote} ...")
+        scheduler.run_advancement_checks(args.promote)
+    else:
+        scheduler.generate_candidates()
+        results = scheduler.run_cycle(budget=args.budget)
 
-    print(f"\nCompleted: {len(results)} experiments. Queue saved to {scheduler.queue_path}")
+        for r in results:
+            print(f"  {r['mechanism_id']:6s} {r['symbol']:8s} {r['timeframe']:4s} -> {r['status']:10s} {r.get('result_summary', '')}")
+
+        print(f"\nCompleted: {len(results)} experiments. Queue saved to {scheduler.queue_path}")
 
 if __name__ == "__main__":
     main()

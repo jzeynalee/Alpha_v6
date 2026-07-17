@@ -17,12 +17,25 @@ Version 3 adds:
   mechanism and timeframe. Promotion decisions are deferred until a minimum
   number of replications have been completed.
 
+Version 4 adds:
+
+- Null-model gate and walk-forward validation methods for advancing a mechanism
+  from L1/L2 to L3.
+- `run_advancement_checks(mechanism_id)` performs:
+    * null-model comparison (mechanism vs naïve `close > SMA20`) for each asset
+    * walk-forward validation on each asset (6-fold purged)
+    * updates the mechanism’s acceptance‑level, null‑model flag, and WF data.
+    * promotes the corresponding evidence‑ladder hypothesis to L3 if thresholds met.
+  This method is called by `scripts/run_research_cycle.py` with the `--promote` flag.
+
 Usage
 -----
     from src.core.experiment_scheduler import ExperimentScheduler
 
     scheduler = ExperimentScheduler()
     scheduler.run_cycle(budget=3)
+    # Advance a mechanism that has gathered cross‑asset replications:
+    scheduler.run_advancement_checks("M002")
 """
 
 from __future__ import annotations
@@ -46,6 +59,8 @@ from src.core.mechanism_registry import (
     Mechanism, MechanismRegistry, registry as _registry
 )
 from src.validation.event_study import EventStudy, EventStudyResult
+from src.backtest.signal_source import CallableSignalSource, BacktestSignal
+from scripts.evaluate_strategies import run_walk_forward   # existing walk‑forward function
 
 logger = logging.getLogger(__name__)
 
@@ -211,15 +226,22 @@ class ExperimentScheduler:
     - Apply stopping rules and exploration/exploitation.
     - Maintain a per‑combination belief state for Bayesian evidence accumulation.
     - Automatically schedule replication experiments for significant results.
+    - Run null‑model gate and walk‑forward validation to advance a mechanism
+      to L3 (Walk‑Forward Validated).
     """
 
     DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
     DEFAULT_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
     EXPLORATION_RATE = 0.2
     MIN_EFFECT_THRESHOLD_BP = 5.0
-    MIN_REPLICATIONS_REQUIRED = 3       # number of cross‑asset replications needed
-    SIGNIFICANCE_THRESHOLD = 0.05        # p‑value threshold to trigger replication
-    REPLICATION_TIMEFRAMES = ["1h", "4h", "1d"]  # timeframes to attempt replication
+    MIN_REPLICATIONS_REQUIRED = 3
+    SIGNIFICANCE_THRESHOLD = 0.05
+    REPLICATION_TIMEFRAMES = ["1h", "4h", "1d"]
+
+    # Parameters for advancement checks
+    DEFAULT_NULL_MODEL_ASSETS = ["ETHUSDT", "SOLUSDT", "BNBUSDT"]
+    DEFAULT_NULL_MODEL_TF = "4h"
+    DEFAULT_WF_WINDOWS = 6
 
     def __init__(
         self,
@@ -607,8 +629,177 @@ class ExperimentScheduler:
             mechanism_id, symbol, timeframe, parent_id,
         )
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  Advancement Checks — null‑model gate + walk‑forward → L3 promotion
+    # ═══════════════════════════════════════════════════════════════════════════
 
-# ── Quick entry point ────────────────────────────────────────────────────────
+    def run_advancement_checks(self, mechanism_id: str, symbols: Optional[List[str]] = None,
+                               timeframe: Optional[str] = None, n_wf_windows: int = 6):
+        """
+        Run null‑model gate and walk‑forward validation for *mechanism_id*.
+        If both checks pass, promote the mechanism to L3 in the evidence ladder
+        and update the mechanism registry confidence components.
+        """
+        mech = self.registry.get(mechanism_id)
+        if mech is None:
+            logger.error("Advancement: unknown mechanism %s", mechanism_id)
+            return
+
+        symbols = symbols or self.DEFAULT_NULL_MODEL_ASSETS
+        timeframe = timeframe or self.DEFAULT_NULL_MODEL_TF
+
+        # --- null‑model gate ---
+        logger.info("Advancement: null‑model gate for %s on %s / %s", mechanism_id, symbols, timeframe)
+        beaten_assets = 0
+        for sym in symbols:
+            if self._check_null_model(mech, sym, timeframe):
+                beaten_assets += 1
+        null_passed = beaten_assets >= max(2, len(symbols) // 2)  # majority
+        logger.info("Advancement: null‑model beaten on %d/%d assets", beaten_assets, len(symbols))
+
+        # --- walk‑forward validation ---
+        logger.info("Advancement: walk‑forward validation for %s on %s / %s", mechanism_id, symbols, timeframe)
+        total_passed = 0
+        total_windows = 0
+        for sym in symbols:
+            passed, total = self._run_walk_forward_check(mech, sym, timeframe, n_wf_windows)
+            total_passed += passed
+            total_windows += total
+        wf_passed = total_passed >= 2  # at least 2 positive folds across all assets
+
+        # --- update mechanism registry ---
+        mech.null_model_beaten = null_passed
+        mech.n_wf_windows_passed = total_passed
+        mech.n_wf_windows_total = total_windows
+        if null_passed and wf_passed:
+            mech.acceptance_level = 4  # Walk‑Forward Validated
+            logger.info("Advancement: %s promoted to acceptance level 4", mechanism_id)
+        else:
+            logger.warning("Advancement: %s did not meet L3 thresholds", mechanism_id)
+        self.registry.save()
+
+        # --- promote evidence‑ladder hypothesis for the mechanism itself ---
+        record = self.ladder.get(mechanism_id)
+        if record:
+            target_level = EvidenceLevel.L3 if (null_passed and wf_passed) else record.evidence_level
+            if target_level > record.evidence_level:
+                stage_result = StageResult(
+                    stage=3,
+                    name="AdvancementChecks",
+                    passed=True,
+                    notes=f"Null‑model={null_passed}, WF positive folds={total_passed}/{total_windows}",
+                )
+                record.promote(target_level, stage_result)
+                self.ladder.save()
+                logger.info("Advancement: %s promoted to L%d in evidence ladder", mechanism_id, target_level.value)
+            else:
+                logger.info("Advancement: %s already at or above L%d", mechanism_id, record.evidence_level.value)
+        else:
+            logger.warning("Advancement: no ladder record for %s", mechanism_id)
+
+    # ── null‑model comparison per asset ─────────────────────────────────────
+
+    def _check_null_model(self, mech: Mechanism, symbol: str, timeframe: str) -> bool:
+        """Return True if the mechanism produces a better (and significant) forward return
+        than a naive `close > SMA20` trigger at the mechanism’s best horizon."""
+        trigger_info = trigger_for_mechanism(mech, symbol, timeframe)
+        if trigger_info is None:
+            logger.warning("Null‑model: no trigger for %s|%s|%s", mech.mechanism_id, symbol, timeframe)
+            return False
+        trig_name, cond_fn = trigger_info
+
+        # run event study for mechanism trigger
+        try:
+            study = EventStudy(symbol, timeframe, max_bars=50000)
+            study.add_trigger(trig_name, cond_fn)
+            df = study.load_data()
+            df = study.compute_features(df)
+            # also add naive trigger
+            study.add_trigger("naive_close_gt_sma20",
+                              lambda d: d["close"] > d["sma20"])
+            results = study.run(df=df)
+        except Exception as exc:
+            logger.error("Null‑model study failed for %s|%s|%s: %s",
+                         mech.mechanism_id, symbol, timeframe, exc)
+            return False
+
+        # extract best horizon result for mechanism
+        mech_res = next((r for r in results if r.trigger_name == trig_name), None)
+        naive_res = next((r for r in results if r.trigger_name == "naive_close_gt_sma20"), None)
+        if mech_res is None or naive_res is None:
+            return False
+
+        # find best horizon for mechanism based on lowest p‑value among significant ones
+        best_mech_h = None
+        best_mech_p = 1.0
+        for h in mech_res.horizons:
+            p = mech_res.t_pvalue.get(h, 1.0)
+            if p < best_mech_p and h in mech_res.significant_horizons:
+                best_mech_p = p
+                best_mech_h = h
+        if best_mech_h is None:
+            # fallback to lowest p-value
+            best_mech_h = min(mech_res.t_pvalue.keys(), key=lambda k: mech_res.t_pvalue[k])
+        mech_mean_bp = mech_res.mean_return.get(best_mech_h, 0.0) * 10000.0
+
+        # same for naive
+        best_naive_h = min(naive_res.t_pvalue.keys(), key=lambda k: naive_res.t_pvalue[k]) if naive_res.t_pvalue else best_mech_h
+        naive_mean_bp = naive_res.mean_return.get(best_naive_h, 0.0) * 10000.0
+
+        # check: mechanism mean > naive mean **and** mechanism p < 0.05
+        mech_sig = best_mech_p < 0.05
+        better = mech_mean_bp > naive_mean_bp
+        logger.info("Null‑model %s|%s|%s: mech=%.1f bp (p=%.4f) naive=%.1f bp → %s",
+                    mech.mechanism_id, symbol, timeframe, mech_mean_bp, best_mech_p, naive_mean_bp,
+                    "PASS" if (mech_sig and better) else "FAIL")
+        return mech_sig and better
+
+    # ── walk‑forward validation per asset ───────────────────────────────────
+
+    def _run_walk_forward_check(self, mech: Mechanism, symbol: str, timeframe: str,
+                                n_windows: int) -> Tuple[int, int]:
+        """
+        Run a walk‑forward backtest using the mechanism’s trigger as a simple
+        long‑only signal. Returns (n_positive_folds, total_folds).
+        """
+        trigger_info = trigger_for_mechanism(mech, symbol, timeframe)
+        if trigger_info is None:
+            return 0, 0
+        _, cond_fn = trigger_info
+
+        # Build a signal function that goes long when the condition is true
+        def signal_fn(window: pd.DataFrame) -> BacktestSignal:
+            mask = cond_fn(window)
+            if not mask.empty and mask.iloc[-1]:
+                return BacktestSignal(direction=1, proba_alpha=0.65, strategy_id=mech.mechanism_id)
+            return BacktestSignal.flat()
+
+        try:
+            from src.backtest.data import load_ohlcv
+            ohlcv = load_ohlcv(source="binance", symbol=symbol, timeframe=timeframe)
+            if ohlcv is None:
+                raise ValueError(f"No OHLCV data for {symbol}/{timeframe}")
+        except Exception as exc:
+            logger.error("WF data load failed for %s/%s: %s", symbol, timeframe, exc)
+            return 0, 0
+
+        try:
+            wf_result = run_walk_forward(ohlcv, signal_fn, n_windows=n_windows)
+        except Exception as exc:
+            logger.error("WF execution failed for %s/%s: %s", symbol, timeframe, exc)
+            return 0, 0
+
+        # run_walk_forward returns dict with:
+        #   n_windows, ir_positive_prob, ir_per_fold, ...
+        n_folds = wf_result.get("n_windows", n_windows)
+        ir_per_fold = wf_result.get("ir_per_fold", [])
+        positive_folds = sum(1 for v in ir_per_fold if v > 0)
+        logger.info("WF %s/%s/%s: %d/%d positive folds",
+                    mech.mechanism_id, symbol, timeframe, positive_folds, n_folds)
+        return positive_folds, n_folds
+
+
+# ── Quick entry point ───────────────────────────────────────────────────────
 def main():
     scheduler = ExperimentScheduler()
     scheduler.generate_candidates()
