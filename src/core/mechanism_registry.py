@@ -143,50 +143,70 @@ class Mechanism:
 
     def confidence_score(self) -> float:
         """
-        Composite mechanism confidence (0-1) from multiple dimensions.
+        Frozen confidence formula v2 — saturating functions, Bayesian-compatible.
 
-        Components:
-          - Assets tested (0-1): min(n_assets/5, 1.0)
-          - Regimes tested (0-1): min(n_regimes/3, 1.0)
-          - Years of data (0-1): min(n_years/5, 1.0)
-          - Walk-forward validation (0 or 0.3)
-          - Effect size (0-0.2): min(|mean_bp|/20, 0.2)
-          - Replications (0-0.1): min(n_replications/5, 0.1) * 0.1
-          - Structural bonus (0 or 0.1)
+        confidence = 0.20*cross_market + 0.20*temporal + 0.15*effect + 0.15*signif
+                   + 0.10*parameter + 0.10*cross_asset + 0.10*oos
 
-        Weights sum to 1.0. Higher = more reliable mechanism.
+        Cross-market uses 1-exp(-n/3) — diminishing returns as assets accumulate.
+        Parameter is binary: broad plateau confirmed or not.
+        OOS is binary: separate confirmation period or not.
         """
-        scores = {
-            "assets": min(self.n_assets_tested / 5.0, 1.0) * 0.20,
-            "regimes": min(self.n_regimes_tested / 3.0, 1.0) * 0.15,
-            "years": min(self.n_years_data / 5.0, 1.0) * 0.15,
-            "walk_forward": (0.20 if self.walk_forward_passed else 0.0),
+        import math
+
+        # Cross-market: saturating at ~3 assets, approaches 1.0 asymptotically
+        cross_market = (1 - math.exp(-self.n_assets_replicated / 3.0)) if self.n_assets_replicated > 0 else 0.0
+
+        # Temporal: fraction of WF windows passed
+        temporal = self.n_wf_windows_passed / max(self.n_wf_windows_total, 1)
+
+        # Effect size: capped at 20bp
+        best_effect = max((abs(d.get('mean_bp', 0)) for d in self.effect_summary.values()), default=0)
+        effect_size = min(best_effect / 20.0, 1.0)
+
+        # Significance: 1 - best p-value
+        p_values = [d.get('p_value', 1.0) for d in self.effect_summary.values() if d.get('p_value') is not None]
+        significance = 1.0 - min(p_values) if p_values else 0.0
+
+        # Parameter: binary — broad plateau confirmed
+        parameter = 1.0 if self.parameter_plateau else 0.0
+
+        # Cross-asset consistency: fraction of tested assets where effect holds
+        cross_asset = self.n_assets_replicated / max(self.n_assets_tested, 1) if self.n_assets_tested > 0 else 0.0
+
+        # Out-of-sample: separate confirmation period exists
+        oos = 1.0 if self.confirmation_period else 0.0
+
+        return round(
+            0.20 * cross_market +
+            0.20 * temporal +
+            0.15 * effect_size +
+            0.15 * significance +
+            0.10 * parameter +
+            0.10 * cross_asset +
+            0.10 * oos,
+            4
+        )
+
+    def meets_protocol(self) -> dict:
+        """Acceptance protocol checks — not confidence alone."""
+        best_p = min((d.get('p_value', 1.0) for d in self.effect_summary.values()), default=1.0)
+        best_effect = max((abs(d.get('mean_bp', 0)) for d in self.effect_summary.values()), default=0)
+        return {
+            'statistical_significance': best_p < 0.05,
+            'economic_significance': best_effect > 12.0,
+            'parameter_stability': self.parameter_plateau,
+            'temporal_walk_forward': self.n_wf_windows_passed >= 2,
+            'cross_asset_replication': self.n_assets_replicated >= 3,
+            'null_model_beaten': self.null_model_beaten,
+            'causal_explanation': len(self.economic_rationale) > 50,
+            'confidence_threshold': self.confidence_score() >= 0.75,
         }
 
-        # Effect size contribution
-        best_effect = 0.0
-        for asset_data in self.effect_summary.values():
-            best_effect = max(best_effect, abs(asset_data.get("mean_bp", 0)))
-        scores["effect_size"] = min(best_effect / 20.0, 1.0) * 0.15
-
-        # Replications
-        scores["replications"] = min(self.n_replications / 5.0, 1.0) * 0.10
-
-        # Structural bonus
-        scores["structural"] = 0.05 if self.discovery_type == DiscoveryType.STRUCTURAL else 0.0
-
-        # Apply tactical decay
-        raw_score = sum(scores.values())
-        if self.discovery_type == DiscoveryType.TACTICAL and self.updated_at:
-            try:
-                age_days = (datetime.now(timezone.utc) -
-                           datetime.fromisoformat(self.updated_at)).days
-                decay = 0.20 ** (age_days / 365.0)  # 20% annual decay
-                raw_score *= max(decay, 0.3)  # Floor at 30% of original
-            except Exception:
-                pass
-
-        return round(raw_score, 4)
+    def acceptance_level_name(self) -> str:
+        return {0: 'Hypothesis', 1: 'Observed', 2: 'Replicated',
+                3: 'Cross-Market', 4: 'Walk-Forward Validated',
+                5: 'Production Ready'}.get(self.acceptance_level, 'Unknown')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
