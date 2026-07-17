@@ -1,9 +1,11 @@
 """
 Experiment Scheduler — Generic, budget-aware discovery loop with Bayesian
-belief tracking, exploration/exploitation, and autonomous replication.
+belief tracking, exploration/exploitation, autonomous replication, and
+automatic promotion to L3 (Walk‑Forward Validated) once cross‑asset replication
+requirements are met.
 
 Automates the cycle:
-    queue → prioritise → execute → update evidence → replicate → repeat
+    queue → prioritise → execute → update evidence → replicate → auto‑advance → repeat
 
 Pluggable priority policies, stopping rules, and mechanism-specific
 trigger factories live here (or in companion modules). The scheduler
@@ -41,6 +43,15 @@ Version 6 adds:
 - The queue now generates experiments for M004 and M005 across all assets and
   timeframes, enabling the scheduler to test these mechanisms without manual
   setup.
+
+Version 7 adds:
+
+- Automatic update of mechanism cross‑asset replication counts (n_assets_replicated,
+  n_assets_tested) after each experiment.
+- **Auto‑advance**: at the end of each cycle the scheduler checks whether any
+  mechanism has gathered ≥3 cross‑asset confirmations; if so, it automatically
+  runs the null‑model gate and walk‑forward validation — the mechanism is
+  promoted to L3 in the evidence ladder if both checks pass.
 
 Usage
 -----
@@ -271,8 +282,8 @@ def default_priority(
 
 class ExperimentScheduler:
     """
-    Generic experiment scheduler with Bayesian belief tracking and
-    autonomous replication.
+    Generic experiment scheduler with Bayesian belief tracking,
+    autonomous replication, and automatic promotion to L3.
 
     Responsibilities
     ----------------
@@ -283,8 +294,9 @@ class ExperimentScheduler:
     - Apply stopping rules and exploration/exploitation.
     - Maintain a per‑combination belief state for Bayesian evidence accumulation.
     - Automatically schedule replication experiments for significant results.
-    - Run null‑model gate and walk‑forward validation to advance a mechanism
-      to L3 (Walk‑Forward Validated).
+    - Track cross‑asset replication counts and automatically run null‑model gate
+      + walk‑forward validation (→ L3 promotion) once ≥3 replications exist.
+
     """
 
     DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
@@ -555,7 +567,7 @@ class ExperimentScheduler:
         budget: int = 3,
         priority_fn: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
-        """Run one full scheduling‑execution cycle."""
+        """Run one full scheduling‑execution cycle, then auto‑advance ready mechanisms."""
         if not self._queue:
             self.generate_candidates()
 
@@ -568,6 +580,11 @@ class ExperimentScheduler:
             self._save_beliefs()
             self.registry.save()
             self.ladder.save()
+
+        # After processing the batch, attempt to advance any mechanism that now
+        # has ≥3 cross‑asset replications.
+        self._auto_advance_mechanisms()
+
         return results
 
     def _run_experiment(self, exp: Dict[str, Any]) -> Dict[str, Any]:
@@ -737,6 +754,9 @@ class ExperimentScheduler:
         if best.significant_horizons:
             self._schedule_replications(exp, p_val, mean_bp)
 
+        # ── Update mechanism cross‑asset counts ─────────────────────────────
+        self._update_mechanism_counts(mech)
+
         return exp
 
     # ── Replication scheduling ──────────────────────────────────────────────
@@ -817,6 +837,27 @@ class ExperimentScheduler:
             mechanism_id, symbol, timeframe, trigger_name, parent_id,
         )
 
+    # ── Mechanism cross‑asset count tracking ────────────────────────────────
+
+    def _update_mechanism_counts(self, mech: Mechanism):
+        """
+        Scan the mechanism’s effect_summary and update n_assets_replicated,
+        n_assets_tested based on significant results.
+        """
+        replicated = set()
+        tested = set()
+        for key, val in mech.effect_summary.items():
+            sym = val.get("symbol", key.split("_")[0])
+            tested.add(sym)
+            p = val.get("p_value", 1.0)
+            mean_bp = val.get("mean_bp", 0.0)
+            if p < self.SIGNIFICANCE_THRESHOLD and mean_bp > self.MIN_EFFECT_THRESHOLD_BP:
+                replicated.add(sym)
+        mech.n_assets_replicated = len(replicated)
+        mech.n_assets_tested = len(tested)
+        logger.info("Mechanism %s cross‑asset counts updated: replicated=%d, tested=%d",
+                    mech.mechanism_id, mech.n_assets_replicated, mech.n_assets_tested)
+
     # ═══════════════════════════════════════════════════════════════════════════
     #  Advancement Checks — null‑model gate + walk‑forward → L3 promotion
     # ═══════════════════════════════════════════════════════════════════════════
@@ -884,6 +925,23 @@ class ExperimentScheduler:
                 logger.info("Advancement: %s already at or above L%d", mechanism_id, record.evidence_level.value)
         else:
             logger.warning("Advancement: no ladder record for %s", mechanism_id)
+
+    # ── Automatic advancement triggering ────────────────────────────────────
+
+    def _auto_advance_mechanisms(self):
+        """Check every mechanism for 3+ cross‑asset replications and run advancement checks
+        if they have not yet passed the null‑model gate."""
+        for mid, mech in self.registry._mechanisms.items():
+            if mid.startswith("_"):
+                continue
+            if mech.n_assets_replicated < self.MIN_REPLICATIONS_REQUIRED:
+                continue
+            # Skip if null‑model gate already passed and walk‑forward was already run
+            if mech.null_model_beaten and mech.n_wf_windows_total > 0:
+                continue
+            logger.info("Auto‑advance trigger met for %s (replicated=%d). Running advancement checks.",
+                        mid, mech.n_assets_replicated)
+            self.run_advancement_checks(mid)
 
     # ── null‑model comparison per asset ─────────────────────────────────────
 
