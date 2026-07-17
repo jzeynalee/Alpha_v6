@@ -331,10 +331,13 @@ class ExperimentScheduler:
         # ── Update mechanism (effect summary) ───────────────────────────────
         if best.significant_horizons:
             best_h = min(best.significant_horizons, key=lambda h: best.t_pvalue.get(h, 1))
-            # Store per‑asset effect
-            if symbol not in mech.effect_summary:
-                mech.effect_summary[symbol] = {}
-            mech.effect_summary[symbol].update({
+            # Store per‑asset per‑timeframe effect using composite key
+            effect_key = f"{symbol}_{timeframe}"
+            if effect_key not in mech.effect_summary:
+                mech.effect_summary[effect_key] = {}
+            mech.effect_summary[effect_key].update({
+                "symbol": symbol,
+                "timeframe": timeframe,
                 "horizon": best_h,
                 "mean_bp": round(summary["best_mean_bp"], 2),
                 "p_value": summary["best_p"],
