@@ -337,10 +337,14 @@ class MechanismRegistry:
                         m.used_by_hypotheses = data.get("used_by_hypotheses", m.used_by_hypotheses)
                         # Load confidence components
                         m.n_assets_tested = data.get("n_assets_tested", m.n_assets_tested)
-                        m.n_regimes_tested = data.get("n_regimes_tested", m.n_regimes_tested)
-                        m.n_years_data = data.get("n_years_data", m.n_years_data)
-                        m.walk_forward_passed = data.get("walk_forward_passed", m.walk_forward_passed)
-                        m.n_replications = data.get("n_replications", m.n_replications)
+                        m.n_assets_replicated = data.get("n_assets_replicated", m.n_assets_replicated)
+                        m.n_wf_windows_passed = data.get("n_wf_windows_passed", m.n_wf_windows_passed)
+                        m.n_wf_windows_total = data.get("n_wf_windows_total", m.n_wf_windows_total)
+                        m.parameter_plateau = data.get("parameter_plateau", m.parameter_plateau)
+                        m.null_model_beaten = data.get("null_model_beaten", m.null_model_beaten)
+                        m.discovery_period = data.get("discovery_period", m.discovery_period)
+                        m.confirmation_period = data.get("confirmation_period", "")
+                        m.acceptance_level = data.get("acceptance_level", m.acceptance_level)
                         if data.get("stability"):
                             m.stability = StabilityMetrics(**data["stability"])
                 logger.info("Mechanism registry loaded from disk (%d mechanisms)", len(saved))
