@@ -1,3 +1,21 @@
+# Alpha_v6 Scientific Architecture
+
+This project has matured into a scientific research platform. Architecture is now **Frozen** to focus on scientific rigor, robustness, and reproducibility.
+
+## Core Roadmap (Scientific Evolution)
+
+1. **Architecture Freeze:** No new architectural layers. Maintenance only for bugs, statistical fixes, and reproducibility improvements.
+2. **Mechanism Stress Testing:** Focus on robustness mapping (Boundary Models, Falsification Criteria).
+3. **Robustness Validation:** Rigorous stress-testing (Parameter Plateaus, Rolling WF, Cross-Market, Regime-Dependent Robustness, Null Models).
+4. **Causal Interaction Studies:** Understanding mechanisms in combination, not isolation.
+5. **Enriched Scientific Reporting:** Enhancing Evidence Cards and Acceptance Protocols to prioritize missing evidence and next-experiment selection without adding new architecture.
+6. **Strategy Generation:** Mechanical derivation of strategies *only* from validated, robust, mechanism-based knowledge.
+
+## The MechanismRecord (Unified Scientific Object)
+The platform is transitioning toward consolidating Mechanism definitions, Causal chains, Evidence (pos/neg), Confidence, Acceptance checks, Boundary maps, and Interaction studies into a single `MechanismRecord`.
+
+---
+
 # ARCHITECTURE.md
 
 > **For LLMs**: Read this third. It describes the system design at every level.
