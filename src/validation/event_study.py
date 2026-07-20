@@ -235,18 +235,25 @@ class EventStudy:
                 perm_pval = self._permutation_test(fwd_rets, event_indices, h)
                 result.permutation_pvalue[h] = float(perm_pval)
 
-                # Significance: t-test significant AND CI does not contain zero
-                if t_pval < 0.05 and ci_low > 0:
+            # ── Multiple-testing correction ──────────────────────────────
+            from statsmodels.stats.multitest import multipletests
+            p_values = [result.t_pvalue[h] for h in self.HORIZONS]
+            _, corrected_pvals, _, _ = multipletests(p_values, alpha=0.05, method='fdr_bh')
+            
+            # Significance: Corrected p-value < 0.05 AND CI does not contain zero
+            for i, h in enumerate(self.HORIZONS):
+                if corrected_pvals[i] < 0.05 and result.bootstrap_ci_lower[h] > 0:
                     result.significant_horizons.append(h)
 
                 logger.info(
                     "  h=%2d: mean=%+.1fbp median=%+.1fbp std=%.1fbp win=%.1f%% "
-                    "t=%.2f p=%.3f CI=[%+.1f, %+.1f]bp perm_p=%.3f %s",
+                    "t=%.2f p=%.3f (corr=%.3f) CI=[%+.1f, %+.1f]bp perm_p=%.3f %s",
                     h,
                     result.mean_return[h] * 10000, result.median_return[h] * 10000,
                     result.std_return[h] * 10000, result.win_rate[h] * 100,
-                    t_stat, t_pval,
-                    ci_low * 10000, ci_high * 10000, perm_pval,
+                    result.t_statistic[h], result.t_pvalue[h], corrected_pvals[i],
+                    result.bootstrap_ci_lower[h] * 10000, result.bootstrap_ci_upper[h] * 10000, 
+                    result.permutation_pvalue[h],
                     "★" if h in result.significant_horizons else "",
                 )
 
