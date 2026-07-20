@@ -128,12 +128,19 @@
 | D016 | ADX alone cannot salvage BTC MR | strategy | Confirmed | **Tactical** |
 | D017 | Z-score MR is real but weak mechanism | mechanism | Confirmed | **Structural** |
 | D018 | Low vol is key regime for mean reversion | regime | Strong | **Tactical** |
+| D019 | Effect scales non-linearly with timeframe | mechanism | Confirmed | **Structural** |
+| D020 | Z-score overbought is asymmetric | mechanism | Strong | **Structural** |
+| D021 | ROC is the momentum driver, not SMA | signal_construction | Strong | **Tactical** |
+| D022 | Funding extremes predict reversal on BTC only | funding | Moderate | **Tactical** |
+| D023 | M001 amplified by strong trends at 4h | mechanism | Moderate | **Structural** |
+| D024 | ROC momentum is commoditized factor | signal_construction | Confirmed | **Structural** |
+| D025 | Null model gate validated | methodology | Confirmed | **Structural** |
 
-**Structural findings** (9): Unlikely to change — safe to build on.
-**Tactical findings** (9): May evolve with market — re-validate periodically.
+**Structural findings** (14): Unlikely to change — safe to build on.
+**Tactical findings** (12): May evolve with market — re-validate periodically.
 
 **Structural decay rate**: 5% confidence reduction per year.
-**Tactical decay rate**: 20% confidence reduction per year. |
+**Tactical decay rate**: 20% confidence reduction per year.
 
 ### D011: Multi-factor momentum dramatically outperforms simple momentum
 - **Confidence**: Strong (4/5)
@@ -199,9 +206,64 @@
 - **Implication**: Any mean-reversion strategy MUST include a low-volatility regime gate. This is the single most important conditional variable for MR.
 - **Status**: Active
 
+### D019: Mechanism effect scales non-linearly with timeframe — invisible at 15m, dominant at 4h/1d
+- **Confidence**: Confirmed (5/5)
+- **Statement**: M001 (Z-score MR) produces +3.6bp at 15m (p=0.22, ns) but +61.1bp at 4h (p=0.0025, ★★★) and +427bp at 1d (p=0.008, ★★★). M002 (ROC momentum) produces +5.3bp at 1h (ns) but +54.8bp at 4h (p=0.002, ★★★). M004 (Funding) produces +33.1bp at 4h (p=0.008). The effect is NOT linear — it jumps dramatically at higher timeframes where noise no longer dominates signal. Transaction costs also drop from ~15bp (15m) to ~8bp (1d), making the edge economically viable.
+- **Experiments**: Higher-timeframe event study: 13,884 bars 4h BTC, 2,313 bars 1d BTC, 13,872 bars 4h ETH
+- **Counterexamples**: 1d sample sizes are small (20-30 events for some triggers) — need more data. ETH 1d has only 36 golden crosses.
+- **Implication**: ALL mechanism validation must include 4h and 1d timeframes. 15m results alone are insufficient to reject a mechanism. The platform should default to testing at multiple timeframes.
+- **Status**: Active
+
+### D020: Z-score overbought is asymmetric — only tops predict reversal, not bottoms
+- **Confidence**: Strong (4/5)
+- **Statement**: Z>+2.5 (overbought) predicts reversal at 4h (+61.1bp, p=0.0025) and 1d (+427bp, p=0.008). Z<-2.5 (oversold) does NOT predict reversal at any timeframe — 4h: -20.8bp, 1d: +15.5bp (ns). BTC is structurally more prone to mean-reversion from tops than bottoms, likely due to leverage-driven long liquidations creating sharper reversals than short squeezes.
+- **Experiments**: M001 event study across 15m/4h/1d BTC (Z>+2.5 vs Z<-2.5 for each timeframe)
+- **Counterexamples**: Oversold reversals may work on other assets (BNB showed stronger MR at 15m). Need cross-asset validation.
+- **Implication**: Mean-reversion strategies should be asymmetric — only short overbought conditions, not long oversold. This is the opposite of most MR implementations.
+- **Status**: Active
+
+### D021: Rate of Change (ROC) is the momentum driver, not SMA crossover
+- **Confidence**: Strong (4/5)
+- **Statement**: Decomposing M002 (Trend Continuation) on ETH 1h showed SMA golden cross produced +5.3bp (ns) while ROC(5)>0.5% produced +6.5bp at h=5 (ns). On ETH 4h, ROC(5)>0.5% produced +54.8bp at h=20 (p=0.002, ★★★) — significant across 4 of 5 horizons. The SMA crossover component adds noise, not signal. The HTF filter (SMA50>SMA100) was actually NEGATIVE at most horizons.
+- **Experiments**: RP002 decomposition — 4 momentum components tested independently on ETH 1h and 4h
+- **Counterexamples**: SMA crossovers may work better on higher-liquidity assets (BTC) or different lookback periods.
+- **Implication**: Momentum strategies should use ROC-based signals, not SMA crossovers. The HTF regime filter should be re-examined or removed.
+- **Status**: Active
+
+### D022: Funding rate extremes predict short-term reversal on BTC, not ETH
+- **Confidence**: Moderate (3/5)
+- **Statement**: Funding z-score > 2.0 on BTC 4h predicts +33.1bp reversal at h=1 (p=0.008, ★★★). Funding z-score < -2.0 on BTC 1d predicts +84.9bp at h=1 (p=0.032, ★). On ETH, NO funding threshold reaches significance at any timeframe — the mechanism is BTC-specific, confirming D001 at the mechanism level on higher timeframes.
+- **Experiments**: M004 event study — funding z-score triggers on BTC/ETH at 4h/1d
+- **Counterexamples**: Low sample sizes (27 events for BTC 4h, 25 for BTC 1d). Need more data.
+- **Implication**: Funding-based strategies should target BTC, not ETH. The deeper BTC perpetual swap market creates stronger arbitrage pressure.
+- **Status**: Active — needs more data
+
 ---
 
-**19 validated findings. 6 Confirmed. 7 Strong. 4 Moderate. 1 Suggestive. 1 Confirmed (was Suggestive).**
+### D023: M001 amplified by strong trends, not suppressed — causal graph edge reversed at 4h
+- **Confidence**: Moderate (3/5)
+- **Statement**: The causal graph predicted "M002 suppresses M001." This is FALSE at 4h. ADX≥25 (strong trend) produces +88.1bp (p=0.001, ★★★) vs ADX<25 producing +22.8bp (ns). Overbought extremes during strong trends create LARGER reversals. Trend AMPLIFIES mean-reversion, not suppresses it. The causal graph needs timeframe-specific edge directions.
+- **Experiments**: M001 × ADX interaction on BTC 4h — 217 events split by ADX
+- **Counterexamples**: 2025-2026 bull market suppressed M001 despite high ADX — trend direction may matter alongside trend strength.
+- **Implication**: Mechanism interactions are timeframe-dependent. Causal graph edges must be validated per timeframe.
+- **Status**: Active — needs trend-direction split
+
+### D024: ROC(5) momentum is a commoditized factor — no unique edge over naive trend
+- **Confidence**: Confirmed (5/5)
+- **Statement**: ROC(5) was tested against naive "close > SMA20" on all 3 assets. ROC only wins at h=1 (+3-8bp). At h≥3, naive SMA20 produces equal or better returns. ETH: naive +58.7bp vs ROC +54.8bp. SOL: naive +109.2bp vs ROC +69.1bp. BTC: naive +51.7bp vs ROC +31.9bp. The momentum factor is real but commoditized.
+- **Experiments**: RP002 null model — ROC vs naive on ETH/SOL/BTC 4h at 5 horizons
+- **Implication**: Simple trend-following has no alpha. M002 needs cross-sectional ranking or regime-conditional triggers.
+- **Status**: Active
+
+### D025: Null model gate correctly rejected a statistically significant mechanism
+- **Confidence**: Confirmed (5/5)
+- **Statement**: M002 passed all other acceptance checks (p=0.002, 55bp, broad plateau, 3/3 assets) but failed null model comparison. Without this gate, M002 would have been accepted at L4 and a strategy built on a commoditized factor. This validates the null model as the single most important protocol check.
+- **Experiments**: RP002 null model gate on 3 assets × 5 horizons
+- **Implication**: Null model comparison is mandatory before L4 promotion for ALL mechanisms.
+
+---
+
+**26 validated findings. 8 Confirmed. 9 Strong. 6 Moderate. 1 Suggestive. 1 Confirmed-was-Suggestive. 1 Confirmed-was-Strong.**
 
 ---
 
@@ -264,6 +326,32 @@ Each entry records a dead-end to prevent repeated experiments.
 - **Reason**: ensemble_002 produced PF=0.57. Equal weighting dilutes strong signals with weak ones.
 - **Do not retry unless**: Dynamic weighting by rolling Sharpe or regime-adaptive allocation.
 
+
+### NEG012: OI divergence as standalone reversal predictor
+- **Outcome**: Rejected
+- **Reason**: Event study on 50,000 BTC 15m bars (2,026 bearish OI divergence events, 1,919 bullish) found ZERO statistically significant predictive power. Mean forward returns near zero (-0.2 to +1.9bp), win rates 48-52%. No horizon (1-20 bars) reached significance. The strategy's apparent PF=1.08 was either window-dependent or came from trade management, not the entry signal.
+- **Do not retry unless**: OI divergence is combined with a second confirmation mechanism (e.g., funding extreme, volume spike, or trend alignment).
+
+### NEG013: Momentum continuation on 1h timeframe
+- **Outcome**: Rejected
+- **Reason**: Decomposed M002 on ETH 1h (20k bars). No component reached significance — SMA golden cross: +5.3bp (p=0.26), ROC(5): +6.5bp (p=0.09), HTF filter: NEGATIVE effect. Combined signal: +7.9bp (perm_p=0.29). The strategy's apparent PF=1.71 came from trade management or window selection, not predictive entry signals.
+- **Do not retry unless**: Tested on 4h+ timeframe where the mechanism IS significant (D019, D021).
+
+### NEG014: OI divergence on 15m timeframe
+- **Outcome**: Rejected
+- **Reason**: See NEG012. Additionally, the mechanism shows no improvement at higher timeframes — 4h OI data would be needed but OI metrics are 5m native. The OI signal may need a fundamentally different construction.
+- **Do not retry unless**: OI data is resampled to 4h with proper aggregation (sum, not ffill), or combined with funding rate as a composite crowding indicator.
+
+### NEG015: Short-term (15m/1h) mechanism testing as definitive rejection
+- **Outcome**: Rejected as a methodology
+- **Reason**: D019 proves mechanisms invisible at 15m can be highly significant at 4h/1d. Rejecting a mechanism based solely on 15m data is a methodological error. ALL mechanism validation must include 4h+ timeframes.
+- **Do not retry unless**: N/A — this is a process change, not a hypothesis.
+
+### NEG016: ROC(5) momentum on 4h as unique alpha
+- **Outcome**: Rejected
+- **Reason**: ROC(5)>0.5% was tested against naive "close > SMA20" on ETH, SOL, BTC at 4h. ROC only beats naive at h=1 (marginal +3-8bp). At all longer horizons (h≥3), naive SMA20 produces equal or better returns. SOL: naive +109bp vs ROC +69bp. The factor is real but commoditized.
+- **Do not retry unless**: Momentum signal is reconstructed using cross-sectional ranking, volume-weighted momentum, or regime-conditional triggers.
+
 ---
 
-**17 validated findings + 11 negative-knowledge entries.**
+**26 validated findings (8 Confirmed, 9 Strong, 6 Moderate, 1 Suggestive, 1 Confirmed-was-Suggestive, 1 Confirmed-was-Strong) + 16 negative-knowledge entries.**

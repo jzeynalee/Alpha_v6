@@ -1,180 +1,191 @@
 # NEXT_ACTION.md
 
 > **For LLMs**: After reading PROJECT_STATE.md, read this file. It tells you exactly what to do.
+> **ARCHITECTURE FREEZE v1.0** — No new modules. No new registries. No new graphs. Only bug fixes and experiments.
 
 ---
 
-## The Methodology Shift (2026-07-16)
+## The Methodology (2026-07-16)
 
-**OLD**: Test complete trading strategies → measure Profit Factor → iterate blindly
+Every hypothesis must trace a causal chain: **Cause → Mechanism → Observable → Prediction**.
 
-**NEW**: Test market mechanisms first → build strategies second
-
-**Why**: When a strategy fails, you need to know WHY. The event-study engine (`src/validation/event_study.py`) decomposes each hypothesis into sub-questions about the underlying mechanism before any trading rules are constructed.
+```
+Liquidity Crunch → M001 (Liquidity Exhaustion) → Z-score → Reversal
+Institutional Flow → M002 (Trend Continuation) → Momentum → Continuation
+Profit Taking     → M003 (Position Unwind)      → OI Div   → Reversal
+```
 
 **Read**: `docs/methodology/event_study_method.md` for the full methodology.
 
 ---
 
-## Priority 1: Apply Event-Study Methodology to Existing Hypotheses
+## Priority 1: Event Study on RP003 — Position Unwind (OI Divergence)
 
-Instead of running full strategy backtests, decompose each active hypothesis using the event-study framework:
+**Why first**: pos_002 produced PF=1.08 with 96 trades — the most active positive strategy. But the mechanism was never validated. Confirming or rejecting M003 will reduce more uncertainty than refining already-understood M001.
 
-### Already Done
-- [x] `btc_mr_l2` — H01-H06 decomposed (see `docs/research/btc_mr_l2_decomposed_20260716.md`)
-  - Mechanism CONFIRMED but too weak for 15m trading (D017, D018)
-  - Next: test on 4h/1d where moves are larger relative to costs
-
-### Next Candidates (in priority order)
-
-#### 1. `pos_002` — OI Divergence Reversal (Highest Priority)
-This is the most active PositioningAlpha strategy (96 trades, PF=1.08). Decompose it:
+### H01: Does OI divergence predict reversal?
 
 ```python
 from src.validation.event_study import EventStudy
+from src.features.positioning_enricher import enrich_ohlcv, clear_cache
+from src.core.dataset_registry import registry
+clear_cache()
+
+# Load and enrich BTC 15m data
+df = registry.get_ohlcv("binance", "BTCUSDT", "15m")
+df = df.iloc[-50000:].copy().reset_index()
+df = enrich_ohlcv(df, "BTCUSDT")
+df = df.reset_index()
+
 study = EventStudy("BTCUSDT", "15m", max_bars=50000)
 
-# H01: Does OI divergence predict reversal?
-study.add_trigger("oi_div_bearish",
-    lambda df: (df["close"] > df["sma20"]) & (df["sum_open_interest"] < df["oi_ma_20"]))
-study.add_trigger("oi_div_bullish", 
-    lambda df: (df["close"] < df["sma20"]) & (df["sum_open_interest"] > df["oi_ma_20"]))
+# Bearish OI divergence: price up + OI down → short
+study.add_trigger("oi_div_bearish", lambda d:
+    (d["close"] > d["sma20"]) & (d["sum_open_interest"] < d["oi_ma_20"]))
+
+# Bullish OI divergence: price down + OI up → long
+study.add_trigger("oi_div_bullish", lambda d:
+    (d["close"] < d["sma20"]) & (d["sum_open_interest"] > d["oi_ma_20"]))
 
 results = study.run()
+
+# H03: Regime dependence (where does it work?)
+# boundaries = study.find_boundaries("oi_div_bearish", "atr_percentile")
+
+# H04/H05: Cross-asset + interaction
+# ca = study.cross_asset("oi_div_bearish", ["ETHUSDT", "SOLUSDT", "BNBUSDT"])
+# interaction = study.interaction_study("oi_div_bearish", "atr_percentile", "regime_trend")
 ```
 
-Key questions to answer:
-- Which horizon does the divergence predict? (1, 3, 5, 10 bars?)
-- Does it work better in trending or ranging regimes?
-- Is it stronger on BTC or ETH?
-
-#### 2. `pos_004` — Funding Cross-Asset Divergence
-Best Sharpe in PositioningAlpha (0.89). Decompose:
-- Does BTC-ETH funding spread predict convergence?
-- What spread threshold maximizes predictive power?
-- How long does convergence take?
-
-#### 3. `eth_mom_l1` — Multi-Factor Momentum
-Best overall PF (1.71). Decompose:
-- Which component drives the edge? (SMA crossover? ROC? Volume?)
-- Does the HTF regime filter actually improve signal quality?
-- At what horizon does momentum decay?
-
-#### 4. `exp_001` — ATR Compression Breakout (on SOL)
-D015 showed SOL outperforms BTC. Decompose:
-- At what ATR compression threshold does expansion become predictable?
-- Is volume confirmation necessary or redundant?
-- What is the optimal holding period?
+**Questions to answer**:
+- Does OI divergence predict reversal at p < 0.05?
+- At which horizon (1, 3, 5, 10, 20)?
+- Which regime? (vol, trend, volume)
+- Which assets? (ETH, SOL, BNB)
+- What's the OI_div × vol_regime interaction?
 
 ---
 
-## How to Run an Event Study
+## Priority 2: Event Study on RP002 — Trend Continuation (Momentum)
 
-```bash
-# Quick event study (interactive)
-python -c "
-from src.validation.event_study import EventStudy
-study = EventStudy('BTCUSDT', '15m', max_bars=50000)
-study.add_trigger('z_neg_2.5', lambda df: df['z_score'] < -2.5)
-results = study.run()
-print(study.report(results))
-"
+**Why second**: M002 is our highest-confidence mechanism (0.140) but has zero completed sub-hypotheses. eth_mom_l1 produced PF=1.71 — the best individual result — but we don't know WHICH component drives it.
 
-# Cross-asset validation
-python -c "
-from src.validation.event_study import EventStudy
-study = EventStudy('BTCUSDT', '15m', max_bars=50000)
-study.add_trigger('z_neg_2.5', lambda df: df['z_score'] < -2.5)
-ca = study.cross_asset('z_neg_2.5', ['ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'])
-for sym, vals in ca.items(): print(sym, vals)
-"
-```
-
----
-
-## Priority 2: Higher-Timeframe MR Testing
-
-D017 showed Z-score MR exists but is too weak on 15m. Test on larger timeframes:
+### Decompose the multi-factor momentum signal
 
 ```python
-# 4-hour BTC
-study = EventStudy("BTCUSDT", "4h", max_bars=10000)
-study.add_trigger("z_neg_2.5_4h", lambda df: df["z_score"] < -2.5)
-results = study.run()
+study = EventStudy("ETHUSDT", "1h", max_bars=20000)
 
-# 1-day BTC
-study = EventStudy("BTCUSDT", "1d", max_bars=2000)
-study.add_trigger("z_neg_2.5_1d", lambda df: df["z_score"] < -2.5)
+# SMA crossover (10/30)
+study.add_trigger("sma_golden_cross", lambda d:
+    (d["sma10"].shift(1) <= d["sma30"].shift(1)) & (d["sma10"] > d["sma30"]))
+
+# Rate of Change (5-bar > 0.2%)
+study.add_trigger("roc_strong", lambda d:
+    (d["close"] - d["close"].shift(5)) / d["close"].shift(5) > 0.002)
+
+# Volume confirmation
+study.add_trigger("volume_above_median", lambda d:
+    d["volume"] > d["volume"].rolling(20).median())
+
+# HTF regime alignment (SMA50 > SMA100)
+study.add_trigger("htf_bull_aligned", lambda d:
+    d["sma50"] > d["sma100"])
+
+# Combined (current eth_mom_l1 signal)
+study.add_trigger("momentum_full", lambda d:
+    ((d["sma10"].shift(1) <= d["sma30"].shift(1)) & (d["sma10"] > d["sma30"]) |
+     (d["sma10"] > d["sma30"]) & ((d["close"]-d["close"].shift(5))/d["close"].shift(5) > 0.002)) &
+    (d["volume"] > d["volume"].rolling(20).median() * 0.8) &
+    (d["sma50"] > d["sma100"]))
+
 results = study.run()
+```
+
+**Questions to answer**:
+- Which component (SMA crossover, ROC, volume, HTF) contributes most?
+- Are components additive or redundant?
+- At what horizon does momentum decay?
+- Does it work on SOL?
+
+---
+
+## Priority 3: Mechanism Replication
+
+After a mechanism is confirmed on one asset, replicate across others **before** building a strategy:
+
+```
+BTC → ETH → SOL → BNB → XRP → DOGE
+```
+
+Only after replication across 3+ assets should strategy construction begin.
+
+---
+
+## Priority 4: Interaction Studies (Only After Individual Mechanisms Are Validated)
+
+```python
+# H202: M001 + M002 + M003 — top-ranked by research cost optimizer
+study.interaction_study("z_neg_2.5", "regime_trend", "oi_divergence")
 ```
 
 ---
 
-## Priority 3: Strategy Construction (Only After Mechanism Confirmed)
+## Priority 5: Strategy Construction (Only After Mechanism Validated + Replicated)
 
-Only build a complete trading strategy when the mechanism has been validated through the event-study framework. The strategy rules should be directly derived from the evidence:
+Only when a mechanism has been:
+1. Confirmed via event study (H01-H04)
+2. Found to be economically viable (effect size > transaction costs)
+3. Replicated across 3+ assets
+
+Should a strategy be built. The strategy rules must be directly derived from the evidence, not optimized:
 
 ```
 Evidence:
-  - H01 confirmed: Z < -2.5 predicts +0.10% at h=10 in low vol
-  - H03 confirmed: Low vol regime required (ATR percentile < 33%)
-  - H04 confirmed: BTC, ETH, BNB only (not SOL)
+  - H01: OI divergence predicts +8bp at h=5, p=0.03
+  - H03: Works best in neutral trend, low vol
+  - H04: Confirmed on BTC + ETH, NOT on SOL
 
 Strategy:
-  Entry:  Z < -2.5 AND ATR_percentile < 33%
-  Exit:   10 bars OR Z-score crosses above -1.0
-  Assets: BTCUSDT, ETHUSDT, BNBUSDT
-  Size:   Kelly 2% risk per trade
+  Entry:  OI divergence AND atr_percentile < 33% AND regime_trend = neutral
+  Exit:   5 bars OR OI convergence (close crosses SMA20)
+  Assets: BTCUSDT, ETHUSDT
 ```
 
 ---
 
 ## What NOT to Do
 
+- ❌ Do NOT add new architecture modules (Freeze v1.0)
 - ❌ Do NOT run strategy backtests without first validating the mechanism
 - ❌ Do NOT tune strategy parameters before understanding the mechanism
-- ❌ Do NOT test a complete strategy when you can test one question
+- ❌ Do NOT test hypotheses without a causal chain in the graph
+- ❌ Do NOT build strategies before replicating mechanisms across 3+ assets
 - ❌ Do NOT modify existing modules without running `pytest tests/` (171 tests)
-- ❌ Do NOT hard-code data paths — always use DatasetRegistry
 
 ---
 
-## File Map for LLMs
+## Quick Reference
 
-| # | File | Purpose | When to Read |
-|---|------|---------|-------------|
-| 1 | `PROJECT_STATE.md` | Current state | First |
-| 2 | `NEXT_ACTION.md` | This file | Second |
-| 3 | `ARCHITECTURE.md` | System design | Third |
-| 4 | `DISCOVERIES.md` | Validated findings + negative knowledge | Fourth |
-| 5 | `docs/methodology/event_study_method.md` | **Event-study methodology** | Fifth |
-| 6 | `docs/research/roadmap.md` | Research priorities | When planning |
-| 7 | `docs/research/thesis_catalog.md` | All 200+ hypotheses | When selecting |
-| 8 | `src/validation/event_study.py` | Event-study engine | When testing mechanisms |
-| 9 | `src/core/dataset_registry.py` | Data access | When loading data |
-| 10 | `src/core/evidence_ladder.py` | Hypothesis tracking | When evaluating |
-
----
-
-## Quick Reference: Signal Implementation Files
-
-| Family | File | Hypotheses |
-|--------|------|------------|
-| MeanReversionAlpha | `src/features/mean_reversion_signals.py` | btc_mr_l2 |
-| MomentumAlpha | `src/features/momentum_signals.py` | eth_mom_l1, sol_mom_l1 |
-| ExpansionAlpha | `src/features/expansion_signals.py` | exp_001, exp_002, exp_003, vol_comp_l0 |
-| PositioningAlpha | `src/features/positioning_signals.py` | pos_001-005, funding_div_l0 |
-| PositioningAlpha | `src/features/positioning_enricher.py` | OI + funding data enrichment |
-| EnsembleAlpha | `src/features/ensemble_signals.py` | ensemble_001, ensemble_002 |
-| Evaluation | `scripts/evaluate_strategies.py` | Full pipeline evaluation |
-| Portfolio | `scripts/portfolio_backtest.py` | Multi-strategy backtest |
+| Tool | How to Use |
+|------|-----------|
+| Event study | `from src.validation.event_study import EventStudy` |
+| Mechanism confidence | `from src.core.mechanism_registry import registry` |
+| Causal chains | `from src.core.causal_graph import causal_graph` |
+| Auto hypothesis gen | `causal_graph.suggest_hypotheses()` |
+| Cost-optimized ranking | `registry.research_cost_optimize()` |
+| OI data enrichment | `from src.features.positioning_enricher import enrich_ohlcv` |
+| Full pipeline eval | `python scripts/evaluate_strategies.py --hypothesis pos_002` |
+| Test suite | `pytest tests/` (171 tests) |
 
 ---
 
 ## Current State (2026-07-16)
 
-- **Evidence ladder**: 38 hypotheses, 19 validated discoveries, 11 negative knowledge entries
-- **Tested through pipeline**: 15 hypotheses (7 auto-testable + 6 Program A + 2 ensembles)
-- **Positive PF (>1.0)**: pos_004 (1.11), pos_002 (1.08), eth_mom_l1 (1.71), sol_mom_l1 (1.28), exp_001 on SOL (1.09)
-- **Mechanism-validated**: btc_mr_l2 (D017, D018 — confirmed but too weak for costs)
-- **Next**: Event studies on pos_002, pos_004, eth_mom_l1, exp_001
+| Component | Status |
+|-----------|--------|
+| Architecture | **Freeze v1.0** — 6 signal families, mechanism registry (M001-M005), causal graph, event-study engine |
+| Evidence ladder | 38 hypotheses, 19 validated discoveries (9 structural, 9 tactical), 11 negative knowledge |
+| RP001 (Liquidity Exhaustion) | **Completed** — mechanism confirmed but too weak for 15m |
+| RP002 (Trend Continuation) | **Not started** — highest-confidence mechanism, 0/6 hypotheses |
+| RP003 (Position Unwind) | **In progress** — OI divergence, best active strategy |
+| Next | Execute RP003 event study, then RP002, then interaction H202 |
