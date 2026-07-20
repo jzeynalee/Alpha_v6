@@ -148,6 +148,16 @@ class StageResult:
 
 
 @dataclass
+class EvidenceLadderMetadata:
+    """Persistent metadata for the ladder."""
+    total_trials: int = 0
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class HypothesisRecord:
     """
     Full lifecycle record of one alpha hypothesis.
@@ -258,24 +268,7 @@ class HypothesisRecord:
     def evidence_score(self) -> "EvidenceScore":
         """
         Compute a multi-dimensional evidence score.
-
-        Instead of a single L0-L6 level, this scores the hypothesis on
-        independent axes and returns a weighted composite. This is the
-        recommended way to compare hypotheses — the linear L0-L6 level
-        is kept for backward compatibility.
-
-        Axes (each 0.0–1.0):
-          - economic_rationale: Does the hypothesis have a sound economic basis?
-          - sample_size: Has enough data been used?
-          - cross_validation: Has walk-forward been performed?
-          - regime_stability: Does it work across Bull/Bear/Neutral?
-          - cross_asset: Has it been validated on other assets?
-          - transaction_costs: Does it survive realistic fees?
-          - statistical_confidence: Bootstrap / p-value / significance
-          - production_readiness: Is it deployable?
-
-        Returns an EvidenceScore dataclass with per-axis scores and a
-        weighted total (0.0–1.0).
+        ...
         """
         return compute_evidence_score(self)
 
@@ -478,7 +471,20 @@ class EvidenceLadder:
     def __init__(self, path: Optional[str] = None) -> None:
         self.path = Path(path or self.DEFAULT_PATH)
         self._hypotheses: Dict[str, HypothesisRecord] = {}
+        self._metadata = EvidenceLadderMetadata()
         self._loaded = False
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+
+    def increment_trials(self) -> int:
+        """Increment the global experiment trial count."""
+        self._metadata.total_trials += 1
+        self._metadata.updated_at = datetime.now(timezone.utc).isoformat()
+        return self._metadata.total_trials
+
+    def get_total_trials(self) -> int:
+        """Return the global experiment trial count."""
+        return self._metadata.total_trials
 
     # ── CRUD ─────────────────────────────────────────────────────────────────
 
@@ -597,6 +603,7 @@ class EvidenceLadder:
             and r.evidence_level == EvidenceLevel.L0
             and r.retry_count == 0
         ]
+    # [Rest of existing CRUD methods...]
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -604,8 +611,9 @@ class EvidenceLadder:
         """Persist the full ladder to disk as JSON."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "version": "1.0",
+            "version": "1.1",
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": self._metadata.to_dict(),
             "hypotheses": [
                 r.to_dict() for r in self._hypotheses.values()
             ],
@@ -613,8 +621,8 @@ class EvidenceLadder:
         with open(self.path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
         logger.info(
-            "Evidence Ladder saved: %d hypotheses → %s",
-            len(self._hypotheses), self.path,
+            "Evidence Ladder saved: %d hypotheses, %d trials → %s",
+            len(self._hypotheses), self._metadata.total_trials, self.path,
         )
 
     def load(self) -> bool:
@@ -629,6 +637,12 @@ class EvidenceLadder:
         except (json.JSONDecodeError, OSError) as exc:
             logger.error("Failed to load evidence ladder: %s", exc)
             return False
+        
+        # Load metadata
+        meta_data = data.get("metadata", {})
+        self._metadata = EvidenceLadderMetadata(**meta_data)
+        
+        # Load hypotheses
         hypotheses_data = data.get("hypotheses", [])
         loaded = 0
         for hd in hypotheses_data:
@@ -640,8 +654,8 @@ class EvidenceLadder:
                 logger.warning("Skipping corrupt hypothesis record: %s", exc)
         self._loaded = True
         logger.info(
-            "Evidence Ladder loaded: %d hypotheses from %s (version=%s).",
-            loaded, self.path, data.get("version", "?"),
+            "Evidence Ladder loaded: %d hypotheses (%d trials) from %s (version=%s).",
+            loaded, self._metadata.total_trials, self.path, data.get("version", "?"),
         )
         return True
 
