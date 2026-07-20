@@ -102,9 +102,13 @@ class ExperimentResult:
     started_at: str = ""
     completed_at: str = ""
 
+    # Provenance
+    git_hash: str = ""
+
     # Backtest metrics
     profit_factor: float = 0.0
-    sharpe: float = 0.0
+    # [Rest of dataclass...]
+
     win_rate: float = 0.0
     total_return_pct: float = 0.0
     max_drawdown_pct: float = 0.0
@@ -222,12 +226,20 @@ class ExperimentManager:
             spec.experiment_id = (
                 f"{spec.hypothesis_id}_{spec.symbol}_{spec.timeframe}_{ts}"
             )
+        
+        # Capture provenance
+        try:
+            import subprocess
+            git_hash = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()
+        except:
+            git_hash = "unknown"
 
         result = ExperimentResult(
             experiment_id=spec.experiment_id,
             hypothesis_id=spec.hypothesis_id,
             symbol=spec.symbol,
             timeframe=spec.timeframe,
+            git_hash=git_hash,
             status="running",
         )
 
@@ -326,15 +338,21 @@ class ExperimentManager:
         # ── Step 7: Done ───────────────────────────────────────────────────
         result.status = "completed"
         result.completed_at = datetime.now(timezone.utc).isoformat()
+        
+        # Increment global trial counter
+        self.ladder.increment_trials()
+        self.ladder.save()
+        
         self._save_result(result)
 
         logger.info(
-            "Experiment %s COMPLETED: PF=%.2f, stages=%dP/%dF, level=%s",
-            spec.experiment_id,
+            "Experiment %s COMPLETED: PF=%.2f, stages=%dP/%dF, level=%s (total_trials=%d)",
+            result.experiment_id,
             result.profit_factor,
             result.stages_passed,
             result.stages_failed,
             result.final_level,
+            self.ladder.get_total_trials(),
         )
         return result
 
@@ -576,6 +594,7 @@ class ExperimentManager:
             "hypothesis_id": result.hypothesis_id,
             "symbol": result.symbol,
             "timeframe": result.timeframe,
+            "git_hash": result.git_hash,
             "status": result.status,
             "started_at": result.started_at,
             "completed_at": result.completed_at,
