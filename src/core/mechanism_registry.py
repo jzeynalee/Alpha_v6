@@ -39,6 +39,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# REMOVED: from src.core.experiment_scheduler import _m001_trigger, _m002_trigger
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +74,18 @@ class StabilityMetrics:
 
 
 @dataclass
+class BoundaryModel:
+    """Explicit boundary conditions for a mechanism."""
+    model_id: str
+    asset: str
+    atr_range: Tuple[float, float]
+    timeframe: str
+    trend_condition: str
+    funding_condition: str
+    confidence: float
+
+
+@dataclass
 class Mechanism:
     """
     A reusable market mechanism.
@@ -101,6 +115,10 @@ class Mechanism:
         Rolling window stability
     used_by_hypotheses : List[str]
         Which hypotheses use this mechanism
+    falsification_criteria : List[str]
+        Conditions under which the mechanism is considered failed
+    boundary_models : Dict[str, BoundaryModel]
+        Explicit boundary models for specific assets/conditions
     """
 
     mechanism_id: str
@@ -114,6 +132,8 @@ class Mechanism:
     boundaries: List[MechanismBoundary] = field(default_factory=list)
     stability: Optional[StabilityMetrics] = None
     used_by_hypotheses: List[str] = field(default_factory=list)
+    falsification_criteria: List[str] = field(default_factory=list)
+    boundary_models: Dict[str, BoundaryModel] = field(default_factory=dict)
     # ── Frozen confidence components ────────────────────────────────────
     n_assets_tested: int = 0          # Assets where mechanism confirmed at target tf
     n_assets_replicated: int = 0      # Assets where mechanism replicates
@@ -143,26 +163,23 @@ class Mechanism:
 
     def confidence_score(self) -> float:
         """
-        Frozen confidence formula v2 — saturating functions, Bayesian-compatible.
+        Frozen confidence formula v3 — decoupled components, no arbitrary caps.
 
-        confidence = 0.20*cross_market + 0.20*temporal + 0.15*effect + 0.15*signif
-                   + 0.10*parameter + 0.10*cross_asset + 0.10*oos
-
-        Cross-market uses 1-exp(-n/3) — diminishing returns as assets accumulate.
-        Parameter is binary: broad plateau confirmed or not.
-        OOS is binary: separate confirmation period or not.
+        confidence = 0.20*replication + 0.20*temporal + 0.15*effect + 0.15*signif
+                   + 0.10*parameter + 0.10*oos + 0.10*robustness
         """
         import math
 
-        # Cross-market: saturating at ~3 assets, approaches 1.0 asymptotically
-        cross_market = (1 - math.exp(-self.n_assets_replicated / 3.0)) if self.n_assets_replicated > 0 else 0.0
+        # Replication: Combines cross-market and cross-asset evidence
+        n_repl = max(self.n_assets_replicated, 0)
+        replication = (1 - math.exp(-n_repl / 3.0))
 
         # Temporal: fraction of WF windows passed
         temporal = self.n_wf_windows_passed / max(self.n_wf_windows_total, 1)
 
-        # Effect size: capped at 20bp
+        # Effect size: Soft saturating at 50bp (was hard 20bp cap)
         best_effect = max((abs(d.get('mean_bp', 0)) for d in self.effect_summary.values()), default=0)
-        effect_size = min(best_effect / 20.0, 1.0)
+        effect_size = 1 - math.exp(-best_effect / 50.0)
 
         # Significance: 1 - best p-value
         p_values = [d.get('p_value', 1.0) for d in self.effect_summary.values() if d.get('p_value') is not None]
@@ -171,19 +188,19 @@ class Mechanism:
         # Parameter: binary — broad plateau confirmed
         parameter = 1.0 if self.parameter_plateau else 0.0
 
-        # Cross-asset consistency: fraction of tested assets where effect holds
-        cross_asset = self.n_assets_replicated / max(self.n_assets_tested, 1) if self.n_assets_tested > 0 else 0.0
+        # Robustness (replaces cross-asset consistency): Consistency across tested assets
+        robustness = self.n_assets_replicated / max(self.n_assets_tested, 1) if self.n_assets_tested > 0 else 0.0
 
         # Out-of-sample: separate confirmation period exists
         oos = 1.0 if self.confirmation_period else 0.0
 
         return round(
-            0.20 * cross_market +
+            0.20 * replication +
             0.20 * temporal +
             0.15 * effect_size +
             0.15 * significance +
             0.10 * parameter +
-            0.10 * cross_asset +
+            0.10 * robustness +
             0.10 * oos,
             4
         )
@@ -226,13 +243,27 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
                           "phenomenon amplified by leverage in crypto.",
         discovery_type=DiscoveryType.STRUCTURAL,
         inputs=["z_score", "atr_percentile"],
+        trigger_fn=_m001_trigger()[1],
         effect_summary={
             "BTCUSDT": {"horizon": 5, "mean_bp": 3.6, "p_value": 0.22, "best_regime": "low_vol"},
         },
-        boundaries=[
-            MechanismBoundary("ATR percentile > 67%", -5.0, 350, 188, 0.01),
-            MechanismBoundary("ADX > 25", -2.0, 400, 138, 0.08),
+        falsification_criteria=[
+            "ADX > 25 (High trend)",
+            "High volatility expansion (ATR > 90th percentile)",
+            "News-driven regime (detected via sentiment anomaly)",
+            "Low liquidity environment (insufficient depth)"
         ],
+        boundary_models={
+            "BTC_4h_0.35_0.60": BoundaryModel(
+                model_id="M001_BTC_4h_B01",
+                asset="BTCUSDT",
+                atr_range=(0.35, 0.60),
+                timeframe="4h",
+                trend_condition="ADX < 25",
+                funding_condition="neutral",
+                confidence=0.82
+            )
+        },
     ),
 
     "M002": Mechanism(
@@ -249,6 +280,22 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
         effect_summary={
             "ETHUSDT": {"horizon": 10, "mean_bp": 12.0, "p_value": 0.02, "best_regime": "bull"},
             "SOLUSDT": {"horizon": 5, "mean_bp": 8.0, "p_value": 0.05, "best_regime": "bull"},
+        },
+        falsification_criteria=[
+            "ROC(5) < 0.5% (Weak momentum)",
+            "Market regime reversal (detected via HTF EMA crossing)",
+            "Volume divergence"
+        ],
+        boundary_models={
+            "ETH_4h_ROC_only": BoundaryModel(
+                model_id="M002_ETH_4h_B01",
+                asset="ETHUSDT",
+                atr_range=(0.0, 1.0),
+                timeframe="4h",
+                trend_condition="ROC > 0.5%",
+                funding_condition="any",
+                confidence=0.76
+            )
         },
     ),
 
