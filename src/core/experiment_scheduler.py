@@ -90,7 +90,11 @@ def trigger_for_mechanism(
 
 # ── Built-in triggers ────────────────────────────────────────────────────────
 def _m001_trigger() -> Tuple[str, Callable]:
-    return ("z_overbought_2.5", lambda df: df["z_score"] > 2.5)
+    """Refined trigger: Z-score > 2.5 with a volatility threshold filter."""
+    def condition(df: pd.DataFrame) -> pd.Series:
+        # Z-score > 2.5 AND ATR percentile > 30% to ensure enough liquidity
+        return (df["z_score"] > 2.5) & (df["atr_percentile"] > 0.3)
+    return ("z_overbought_2.5_filt", condition)
 
 _register_trigger("M001", _m001_trigger)
 
