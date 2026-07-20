@@ -54,6 +54,7 @@ from src.core.evidence_ladder import (
 from src.core.mechanism_registry import (
     Mechanism, MechanismRegistry, registry as _registry
 )
+from src.core.dataset_registry import registry as _data_registry
 from src.validation.event_study import EventStudy, EventStudyResult
 from src.backtest.signal_source import CallableSignalSource, BacktestSignal
 from scripts.evaluate_strategies import run_walk_forward   # existing walk‑forward function
@@ -309,6 +310,7 @@ class ExperimentScheduler:
         self,
         ladder: Optional[EvidenceLadder] = None,
         registry: Optional[MechanismRegistry] = None,
+        dataset_registry: Optional[Any] = None,
         queue_path: Optional[Path] = None,
         belief_path: Optional[Path] = None,
         debt_path: Optional[Path] = None,
@@ -316,6 +318,7 @@ class ExperimentScheduler:
         self.ladder = ladder or EvidenceLadder()
         self.ladder.load()
         self.registry = registry or _registry
+        self.dataset_registry = dataset_registry or _data_registry
         self.queue_path = Path(queue_path or "data/experiments/research_queue.json")
         self.belief_path = Path(belief_path or "data/experiments/belief_state.json")
         self.debt_path = Path(debt_path or "data/experiments/research_debt.json")
@@ -1106,17 +1109,20 @@ class ExperimentScheduler:
         _, cond_fn = trigger_info
 
         # Build a signal function that goes long when the condition is true
-        def signal_fn(window: pd.DataFrame) -> BacktestSignal:
+        def signal_fn(symbol: str, window: pd.DataFrame, bar_index: int) -> BacktestSignal:
+            # Re-compute features as the trigger (e.g. z_score) might rely on a full history
+            window = EventStudy(symbol, timeframe, max_bars=50000).compute_features(window)
             mask = cond_fn(window)
             if not mask.empty and mask.iloc[-1]:
                 return BacktestSignal(direction=1, proba_alpha=0.65, strategy_id=mech.mechanism_id)
             return BacktestSignal.flat()
 
         try:
-            from src.backtest.data import load_ohlcv
-            ohlcv = load_ohlcv(source="binance", symbol=symbol, timeframe=timeframe)
+            ohlcv = self.dataset_registry.get_ohlcv("binance", symbol, timeframe)
             if ohlcv is None:
                 raise ValueError(f"No OHLCV data for {symbol}/{timeframe}")
+            if "timestamp" not in ohlcv.columns:
+                ohlcv = ohlcv.reset_index()
         except Exception as exc:
             logger.error("WF data load failed for %s/%s: %s", symbol, timeframe, exc)
             return 0, 0
