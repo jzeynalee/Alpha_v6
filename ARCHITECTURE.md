@@ -61,6 +61,8 @@ Alpha_v6/
 │   ├── research/             ← Roadmaps, thesis catalog, research log
 │   ├── architecture/         ← System design, data flow, experiment pipeline
 │   ├── knowledge/            ← Observations, economic theories, microstructure
+│   ├── methodology/          ← Research methodologies, statistical proofs
+│   │   └── event_study_method.md
 │   └── reports/              ← Experiment reports (auto-generated)
 │
 ├── data/
