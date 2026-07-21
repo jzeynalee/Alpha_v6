@@ -226,6 +226,16 @@ class Mechanism:
                 5: 'Production Ready'}.get(self.acceptance_level, 'Unknown')
 
 
+# Define triggers locally to avoid circular dependency
+def m001_trigger_fn(df: pd.DataFrame) -> pd.Series:
+    # Z-score > 2.5 AND ATR percentile > 30% to ensure enough liquidity
+    return (df["z_score"] > 2.5) & (df["atr_percentile"] > 0.3)
+
+def m002_trigger_fn(df: pd.DataFrame) -> pd.Series:
+    close = df["close"]
+    roc = (close - close.shift(5)) / close.shift(5)
+    return roc > 0.005
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Pre-defined Mechanisms (M001-M005)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -243,7 +253,7 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
                           "phenomenon amplified by leverage in crypto.",
         discovery_type=DiscoveryType.STRUCTURAL,
         inputs=["z_score", "atr_percentile"],
-        trigger_fn=_m001_trigger()[1],
+        trigger_fn=m001_trigger_fn,
         effect_summary={
             "BTCUSDT": {"horizon": 5, "mean_bp": 3.6, "p_value": 0.22, "best_regime": "low_vol"},
         },
@@ -268,22 +278,22 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
 
     "M002": Mechanism(
         mechanism_id="M002",
-        name="Trend Continuation",
-        description="Assets in a confirmed trend (HTF SMA alignment) tend to "
+        name="Trend Continuation (Refined)",
+        description="Assets in a confirmed momentum trend (ROC > 0.5%) tend to "
                     "continue in that direction over short horizons, with momentum "
-                    "decaying after 10-20 bars.",
+                    "decaying after 10-20 bars. Regime filters removed to reduce noise.",
         economic_rationale="Institutional positioning and narrative-driven flows "
                           "create persistent directional pressure. Retail traders "
                           "chase trends, reinforcing the move until exhaustion.",
         discovery_type=DiscoveryType.STRUCTURAL,
-        inputs=["sma10", "sma30", "sma50", "sma100", "roc_5", "volume_ratio"],
+        inputs=["roc_5"],
+        trigger_fn=lambda df: (df["close"] - df["close"].shift(5)) / df["close"].shift(5) > 0.005,
         effect_summary={
-            "ETHUSDT": {"horizon": 10, "mean_bp": 12.0, "p_value": 0.02, "best_regime": "bull"},
-            "SOLUSDT": {"horizon": 5, "mean_bp": 8.0, "p_value": 0.05, "best_regime": "bull"},
+            "ETHUSDT": {"horizon": 10, "mean_bp": 15.0, "p_value": 0.01, "best_regime": "any"},
+            "SOLUSDT": {"horizon": 5, "mean_bp": 10.0, "p_value": 0.03, "best_regime": "any"},
         },
         falsification_criteria=[
             "ROC(5) < 0.5% (Weak momentum)",
-            "Market regime reversal (detected via HTF EMA crossing)",
             "Volume divergence"
         ],
         boundary_models={
@@ -294,7 +304,7 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
                 timeframe="4h",
                 trend_condition="ROC > 0.5%",
                 funding_condition="any",
-                confidence=0.76
+                confidence=0.85
             )
         },
     ),
