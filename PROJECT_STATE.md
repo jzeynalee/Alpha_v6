@@ -29,7 +29,7 @@ The architecture follows: **Market → Mechanisms → Evidence Cards → Factors
 
 | ID | Mechanism | Level | Confidence | Best Effect | Null Model | Verdict |
 |----|-----------|-------|------------|-------------|------------|---------|
-| M001 | Liquidity Exhaustion | **L4** Production Candidate | 0.691 | +61bp 4h / +427bp 1d | ✅ beats random (99.5%), naive, B&H | **ACCEPTED** |
+| M001 | Liquidity Exhaustion | L3 Cross-Market Validated | 0.691 | +61bp 4h / +427bp 1d | ✅ beats random, naive, B&H | **VALIDATED** |
 | M002 | Trend Continuation | **L3** Robust | 0.763 | +55bp 4h | ❌ naive SMA20 beats it on all 3 assets | **NEEDS RECONSTRUCTION** |
 | M003 | Position Unwind | — | 0.205 | — | — | **REJECTED** |
 | M004 | Funding Rotation | L1 Observed | 0.219 | +33bp 4h | — | **EVIDENCE INSUFFICIENT** |
