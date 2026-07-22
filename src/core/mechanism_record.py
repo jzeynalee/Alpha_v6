@@ -42,6 +42,7 @@ class MechanismRecord:
     validation_history: List[str] = field(default_factory=list)  # References to EXP/NEG/D IDs
     known_interactions: Dict[str, str] = field(default_factory=dict) # e.g. {"suppressed_by": "M002"}
     known_failure_domains: List[str] = field(default_factory=list)
+    evidence_gaps: List[str] = field(default_factory=list)
     
     def save(self):
         """Persist to JSON."""
@@ -76,7 +77,8 @@ class MechanismRecord:
             evidence=evidence,
             validation_history=data["validation_history"],
             known_interactions=data["known_interactions"],
-            known_failure_domains=data["known_failure_domains"]
+            known_failure_domains=data["known_failure_domains"],
+            evidence_gaps=data.get("evidence_gaps", [])
         )
 
     @property
