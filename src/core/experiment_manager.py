@@ -438,92 +438,24 @@ class ExperimentManager:
 
         if "meanreversion" in family:
             from src.features.mean_reversion_signals import get_mean_reversion_signal
-
-            fn = get_mean_reversion_signal(record.hypothesis_id)
-            if fn is not None:
-                return fn
-            # Fallback (should never reach here)
-            def mr_signal(symbol, window: pd.DataFrame, bar_index: int = 0):
-                from src.backtest.signal_source import BacktestSignal
-
-                if len(window) < 20:
-                    return BacktestSignal.flat()
-                close = window["close"]
-                sma = close.rolling(20).mean()
-                std = close.rolling(20).std()
-                if pd.isna(sma.iloc[-1]) or pd.isna(std.iloc[-1]) or std.iloc[-1] == 0:
-                    return BacktestSignal.flat()
-                z = (close.iloc[-1] - sma.iloc[-1]) / std.iloc[-1]
-                if z < -1.5:
-                    return BacktestSignal(direction=1, proba_alpha=0.70)
-                elif z > 1.5:
-                    return BacktestSignal(direction=-1, proba_alpha=0.70)
-                return BacktestSignal.flat()
-
-            return mr_signal
-
-        elif "momentum" in family:
+            return get_mean_reversion_signal(record.hypothesis_id)
+        
+        elif "scientificvalidation" in family or "momentum" in family:
             from src.features.momentum_signals import get_momentum_signal
-
-            fn = get_momentum_signal(record.hypothesis_id)
-            if fn is not None:
-                return fn
+            return get_momentum_signal(record.hypothesis_id)
+            
+        elif "positioning" in family:
+            from src.features.positioning_signals import get_positioning_signal
+            return get_positioning_signal(record.hypothesis_id)
 
         elif "expansion" in family or "volatility" in family:
             from src.features.expansion_signals import get_expansion_signal
-
-            fn = get_expansion_signal(record.hypothesis_id)
-            if fn is not None:
-                return fn
-            # Fallback generic vol signal (should never reach for registered IDs)
-            def vol_signal_fallback(symbol, window: pd.DataFrame, bar_index: int = 0):
-                from src.backtest.signal_source import BacktestSignal
-                if len(window) < 20:
-                    return BacktestSignal.flat()
-                close = window["close"]
-                atr = (window["high"] - window["low"]).rolling(14).mean()
-                atr_20 = atr.rolling(20).mean()
-                if pd.isna(atr.iloc[-1]) or pd.isna(atr_20.iloc[-1]) or atr_20.iloc[-1] == 0:
-                    return BacktestSignal.flat()
-                if atr.iloc[-1] < 0.7 * atr_20.iloc[-1]:
-                    mom = close.iloc[-1] - close.iloc[-5]
-                    direction = 1 if mom > 0 else -1
-                    return BacktestSignal(direction=direction, proba_alpha=0.60)
-                return BacktestSignal.flat()
-            return vol_signal_fallback
-
-        elif "positioning" in family:
-            # ── PositioningAlpha: use per-hypothesis signal functions ──────
-            from src.features.positioning_signals import get_positioning_signal
-
-            fn = get_positioning_signal(record.hypothesis_id)
-            if fn is not None:
-                return fn
-            # Fallback: generic funding z-score
-            def pos_generic_signal(symbol, window: pd.DataFrame, bar_index: int = 0):
-                from src.backtest.signal_source import BacktestSignal
-
-                funding_z = window.get("funding_zscore")
-                if funding_z is None or len(window) < 50:
-                    return BacktestSignal.flat()
-                z = funding_z.iloc[-1]
-                if pd.isna(z):
-                    return BacktestSignal.flat()
-                if z > 2.0:
-                    return BacktestSignal(direction=-1, proba_alpha=0.60)
-                elif z < -2.0:
-                    return BacktestSignal(direction=1, proba_alpha=0.60)
-                return BacktestSignal.flat()
-
-            return pos_generic_signal
+            return get_expansion_signal(record.hypothesis_id)
 
         elif "ensemble" in family:
             from src.features.ensemble_signals import get_ensemble_signal
-
-            fn = get_ensemble_signal(record.hypothesis_id)
-            if fn is not None:
-                return fn
-
+            return get_ensemble_signal(record.hypothesis_id)
+            
         return None
 
     @staticmethod
