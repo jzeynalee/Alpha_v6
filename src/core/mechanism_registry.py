@@ -320,6 +320,8 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
                           "and is vulnerable to reversal when profit-taking exhausts.",
         discovery_type=DiscoveryType.TACTICAL,
         inputs=["close", "sma20", "sum_open_interest", "oi_ma_20"],
+        trigger_fn=lambda df: ((df['close'].pct_change(5) > 0.005) & (df['sum_open_interest'].pct_change(5) < -0.005)) | \
+                              ((df['close'].pct_change(5) < -0.005) & (df['sum_open_interest'].pct_change(5) > 0.005)),
         effect_summary={
             "BTCUSDT": {"horizon": 5, "mean_bp": 8.0, "p_value": 0.03, "best_regime": "neutral"},
         },
@@ -336,6 +338,7 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
                           "expensive to hold long, traders rotate to the cheaper one.",
         discovery_type=DiscoveryType.STRUCTURAL,
         inputs=["funding_rate", "funding_spread_btc_eth"],
+        trigger_fn=lambda df: (df['funding_rate'] > 0.001) | (df['funding_rate'] < -0.001),
         effect_summary={
             "BTCUSDT": {"horizon": 10, "mean_bp": 10.0, "p_value": 0.04, "best_regime": "any"},
         },
@@ -353,11 +356,22 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
                           "directionally.",
         discovery_type=DiscoveryType.TACTICAL,
         inputs=["atr14", "atr_ma20", "close", "high", "low"],
+        trigger_fn=lambda df: df['atr_percentile'] < 0.2,
         effect_summary={
             "SOLUSDT": {"horizon": 10, "mean_bp": 9.0, "p_value": 0.06, "best_regime": "low_vol"},
             "BTCUSDT": {"horizon": 5, "mean_bp": 2.0, "p_value": 0.30, "best_regime": "low_vol"},
         },
     ),
+    "M006": Mechanism(mechanism_id="M006", name="Positioning Alpha", trigger_fn=lambda df: df['volume'] > df['volume'].rolling(20).mean() * 2.0),
+    "M007": Mechanism(mechanism_id="M007", name="Expansion Alpha", trigger_fn=lambda df: df['close'] > df['high'].shift(1).rolling(50).max()),
+    "M008": Mechanism(mechanism_id="M008", name="Relative Value Alpha", trigger_fn=lambda df: df['z_score'] < -2.0),
+    "M009": Mechanism(mechanism_id="M009", name="Liquidation Alpha", trigger_fn=lambda df: df['volume'] > df['volume'].rolling(50).mean() * 3.0),
+    "M010": Mechanism(mechanism_id="M010", name="Microstructure Alpha", trigger_fn=lambda df: df['bid_ask_spread'] > df['bid_ask_spread'].rolling(20).mean() * 1.5),
+    "M011": Mechanism(mechanism_id="M011", name="Multi-Timeframe Alpha", trigger_fn=lambda df: df['close'] > df['ema200']),
+    "M012": Mechanism(mechanism_id="M012", name="Ensemble Alpha", trigger_fn=lambda df: df['atr_percentile'] > 0.5),
+    "M013": Mechanism(mechanism_id="M013", name="Cross-Sectional Alpha", trigger_fn=lambda df: df['close'] > df['close'].shift(20)),
+    "M014": Mechanism(mechanism_id="M014", name="Funding Alpha", trigger_fn=lambda df: df['funding_rate'] > 0.001),
+    "M015": Mechanism(mechanism_id="M015", name="Volatility Alpha", trigger_fn=lambda df: df['atr_percentile'] < 0.1),
 }
 
 
