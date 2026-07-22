@@ -6,12 +6,13 @@ def get_m002_record() -> MechanismRecord:
         metadata={
             "mechanism_id": "M002",
             "version": 2,
+            "family": "Momentum",
             "created": "2026-07-16",
             "last_updated": "2026-07-21"
         },
-        description="Trend Continuation (ROC-based).",
+        description="Trend Continuation (ROC-based). Momentum in confirmed trends.",
         causal_chain=["Institutional positioning", "Momentum reinforcement", "Exhaustion"],
-        scientific_rationale="Persistence of directional flows driven by narrative.",
+        scientific_rationale="Persistent directional flows driven by narrative reinforce trends until exhaustion, detectable via ROC.",
         falsification_criteria=[
             "ROC(5) < 0.5% (Weak momentum)",
             "Volume divergence"
