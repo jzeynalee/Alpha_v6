@@ -46,6 +46,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from src.core.evidence_ladder import EvidenceLevel
+from src.core.records import get_record
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,24 @@ class AlphaEngine:
         self._streams: Dict[str, AlphaStream] = {}
 
     # ── Stream management ────────────────────────────────────────────────────
+
+    def load_stream_from_record(self, mechanism_id: str) -> None:
+        """Register an alpha stream based on an authoritative MechanismRecord."""
+        record = get_record(mechanism_id)
+        if not record:
+            logger.warning("MechanismRecord %s not found.", mechanism_id)
+            return
+        
+        # Determine evidence level from validation history
+        level = EvidenceLevel.L3 if record.validation_history else EvidenceLevel.L1
+        
+        stream = AlphaStream(
+            name=record.metadata.get("mechanism_id", mechanism_id),
+            family=record.metadata.get("family", "UnknownFamily"),
+            evidence_level=level,
+            description=record.description
+        )
+        self.register_stream(stream)
 
     def register_stream(self, stream: AlphaStream) -> None:
         """Register an alpha stream for portfolio allocation."""
