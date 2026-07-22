@@ -226,29 +226,36 @@ class BeliefState:
 #  Priority Policies
 # ═══════════════════════════════════════════════════════════════════════════════
 
+from src.core.records import get_record
+
+# ...
+
 def default_priority(
-    mechanism: Mechanism,
+    mechanism_id: str,
     n_assets: int,
     n_regimes: int,
     cost_estimate: float,
-    belief_prob: Optional[float] = None,
+    **kwargs,
 ) -> float:
     """
-    Default information‑gain priority.
-
-    If *belief_prob* is provided (posterior probability that effect > 5 bp),
-    the information gap is 1 - belief_prob.  Otherwise the gap is based on the
-    mechanism's global confidence score.
+    New priority policy based on MechanismRecord evidence gaps.
     """
-    if belief_prob is not None:
-        info_gap = 1.0 - belief_prob
-    else:
-        confidence = mechanism.confidence_score() if mechanism else 0.0
-        info_gap = 1.0 - confidence
+    record = get_record(mechanism_id)
+    if not record:
+        return 0.0
 
-    asset_bonus = math.log2(n_assets + 1)
-    regime_bonus = math.log2(n_regimes + 1)
-    return info_gap * (asset_bonus + regime_bonus) / max(cost_estimate, 1e-3)
+    # Calculate evidence gap: Higher gap = higher priority
+    # Gaps: Missing Boundary Models (0.5), Missing Falsification Criteria (0.3), Missing Evidence (0.2)
+    gap = 0.0
+    if not record.boundary_models:
+        gap += 0.5
+    if not record.falsification_criteria:
+        gap += 0.3
+    if not record.evidence:
+        gap += 0.2
+        
+    return gap * (n_assets + n_regimes) / max(cost_estimate, 1e-3)
+    return gap * (n_assets + n_regimes) / max(cost_estimate, 1e-3)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
