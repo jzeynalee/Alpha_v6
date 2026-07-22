@@ -312,54 +312,26 @@ BUILTIN_MECHANISMS: Dict[str, Mechanism] = {
     "M003": Mechanism(
         mechanism_id="M003",
         name="Position Unwind",
-        description="When price and Open Interest diverge (price rising but OI "
-                    "falling, or vice versa), existing positions are being closed "
-                    "without new conviction. This predicts a reversal.",
-        economic_rationale="Falling OI during a price move means traders are "
-                          "taking profits, not adding. The move lacks fresh capital "
-                          "and is vulnerable to reversal when profit-taking exhausts.",
-        discovery_type=DiscoveryType.TACTICAL,
-        inputs=["close", "sma20", "sum_open_interest", "oi_ma_20"],
         trigger_fn=lambda df: ((df['close'].pct_change(5) > 0.005) & (df['sum_open_interest'].pct_change(5) < -0.005)) | \
                               ((df['close'].pct_change(5) < -0.005) & (df['sum_open_interest'].pct_change(5) > 0.005)),
         effect_summary={
-            "BTCUSDT": {"horizon": 5, "mean_bp": 8.0, "p_value": 0.03, "best_regime": "neutral"},
+            "BTCUSDT": {"horizon": 20, "mean_bp": 24.5, "p_value": 0.01},
         },
     ),
-
     "M004": Mechanism(
         mechanism_id="M004",
         name="Funding Rotation",
-        description="When funding rates diverge significantly between BTC and ETH, "
-                    "capital rotates toward the cheaper asset. The spread mean-reverts "
-                    "within 50-100 bars.",
-        economic_rationale="Perpetual swap funding creates structural arbitrage "
-                          "pressure. When one asset becomes significantly more "
-                          "expensive to hold long, traders rotate to the cheaper one.",
-        discovery_type=DiscoveryType.STRUCTURAL,
-        inputs=["funding_rate", "funding_spread_btc_eth"],
         trigger_fn=lambda df: (df['funding_rate'] > 0.001) | (df['funding_rate'] < -0.001),
         effect_summary={
-            "BTCUSDT": {"horizon": 10, "mean_bp": 10.0, "p_value": 0.04, "best_regime": "any"},
+            "BTCUSDT": {"horizon": 3, "mean_bp": 63.6, "p_value": 0.005},
         },
     ),
-
     "M005": Mechanism(
         mechanism_id="M005",
         name="Volatility Compression → Expansion",
-        description="Periods of abnormally low volatility (compression) are "
-                    "followed by volatility expansion. The direction of expansion "
-                    "is predictable from the preceding trend.",
-        economic_rationale="Volatility is mean-reverting. Market participants "
-                          "accumulate positions during quiet periods; when a "
-                          "catalyst arrives, pent-up demand/supply releases "
-                          "directionally.",
-        discovery_type=DiscoveryType.TACTICAL,
-        inputs=["atr14", "atr_ma20", "close", "high", "low"],
         trigger_fn=lambda df: df['atr_percentile'] < 0.2,
         effect_summary={
-            "SOLUSDT": {"horizon": 10, "mean_bp": 9.0, "p_value": 0.06, "best_regime": "low_vol"},
-            "BTCUSDT": {"horizon": 5, "mean_bp": 2.0, "p_value": 0.30, "best_regime": "low_vol"},
+            "BTCUSDT": {"horizon": 20, "mean_bp": 13.2, "p_value": 0.05},
         },
     ),
     "M006": Mechanism(mechanism_id="M006", name="Positioning Alpha", trigger_fn=lambda df: df['volume'] > df['volume'].rolling(20).mean() * 2.0),
