@@ -278,10 +278,22 @@ class EventStudy:
                     last_event = i
         return indices
 
-    def _compute_forward_returns(self, event_indices: List[int], horizon: int) -> np.ndarray:
+    def _compute_forward_returns(
+        self,
+        event_indices: List[int],
+        horizon: int,
+        df: Optional[pd.DataFrame] = None,
+    ) -> np.ndarray:
         """Compute log forward returns: ln(P_{t+h} / P_t). Additive, symmetric, better for t-tests."""
-        log_close = np.log(self._df["close"].values)
+        source_df = df if df is not None else self._df
+        if source_df is None:
+            raise ValueError("No data available for forward-return calculation")
+        if horizon < 1:
+            raise ValueError("horizon must be >= 1")
+        log_close = np.log(source_df["close"].values)
         n = len(log_close)
+        if any(index < 0 or index >= n - horizon for index in event_indices):
+            raise ValueError("event index cannot support the requested horizon")
         # Vectorized: pre-compute all forward log returns then index
         fwd = np.full(n, np.nan)
         fwd[: n - horizon] = log_close[horizon:] - log_close[: n - horizon]
@@ -293,7 +305,10 @@ class EventStudy:
     def _t_test(returns: np.ndarray) -> Tuple[float, float]:
         """One-sample t-test: H0: mean = 0 vs H1: mean > 0."""
         from math import sqrt
+        from scipy.stats import t as student_t
 
+        returns = np.asarray(returns, dtype=float)
+        returns = returns[np.isfinite(returns)]
         n = len(returns)
         if n < 3:
             return 0.0, 1.0
@@ -302,18 +317,17 @@ class EventStudy:
         if std == 0:
             return 0.0, 1.0
         t_stat = mean / (std / sqrt(n))
-        # Approximate p-value from t-distribution (one-sided)
-        # Using normal approximation for simplicity
-        from math import erf
-        p_val = 1.0 - 0.5 * (1.0 + erf(t_stat / sqrt(2.0)))
+        p_val = float(student_t.sf(t_stat, df=n - 1))
         return t_stat, p_val
 
     @staticmethod
     def _bootstrap_ci(returns: np.ndarray, n_bootstrap: int = 5000, alpha: float = 0.05) -> Tuple[float, float]:
         """Bootstrap 95% confidence interval for mean return."""
+        returns = np.asarray(returns, dtype=float)
+        returns = returns[np.isfinite(returns)]
         n = len(returns)
         if n < 10:
-            return -1.0, 1.0
+            return float("nan"), float("nan")
         rng = np.random.default_rng(42)
         means = np.zeros(n_bootstrap)
         for i in range(n_bootstrap):
@@ -323,43 +337,48 @@ class EventStudy:
         ci_high = float(np.percentile(means, (1 - alpha / 2) * 100))
         return ci_low, ci_high
 
-    def _permutation_test(self, returns: np.ndarray, event_indices: List[int], horizon: int, n_perms: int = 2000, block_size: int = 20) -> float:
-        """Block-bootstrap permutation test preserving serial correlation.
+    def _permutation_test(
+        self,
+        returns: np.ndarray,
+        event_indices: List[int],
+        horizon: int,
+        n_perms: int = 2000,
+        block_size: int = 20,
+        df: Optional[pd.DataFrame] = None,
+    ) -> float:
+        """Test event timing with circular shifts of the event locations.
 
-        Instead of randomizing individual bars (which destroys autocorrelation
-        structure and yields artificially low p-values), we use circular block
-        bootstrapping: shuffle contiguous blocks of `block_size` bars to
-        preserve the local serial correlation of financial returns.
+        A single circular shift per permutation preserves event count and
+        spacing while breaking alignment between triggers and returns.
         """
+        returns = np.asarray(returns, dtype=float)
+        returns = returns[np.isfinite(returns)]
+        if not event_indices or len(returns) == 0:
+            return 1.0
+        source_df = df if df is not None else self._df
+        if source_df is None:
+            raise ValueError("No data available for permutation test")
+        n_valid = len(source_df) - horizon
+        if n_valid <= 0 or horizon < 1 or block_size < 1:
+            return 1.0
+
         observed_mean = float(np.mean(returns))
-        log_close = np.log(self._df["close"].values)
-        n_bars = len(log_close)
+        event_indices = np.asarray(event_indices, dtype=int)
+        if np.any(event_indices < 0) or np.any(event_indices >= n_valid):
+            raise ValueError("event index cannot support the requested horizon")
 
         rng = np.random.default_rng(42)
-        perm_means = np.zeros(n_perms)
-        n_events = len(event_indices)
+        perm_means = np.empty(n_perms, dtype=float)
+        for permutation in range(n_perms):
+            shift = int(rng.integers(0, n_valid))
+            shifted = (event_indices + shift) % n_valid
+            shifted_returns = self._compute_forward_returns(
+                shifted.tolist(), horizon, df=source_df
+            )
+            perm_means[permutation] = float(np.mean(shifted_returns))
 
-        for p in range(n_perms):
-            # Circular block bootstrap: pick random block starts, wrap around
-            n_blocks = max(1, n_events // block_size + 1)
-            block_starts = rng.integers(0, n_bars - horizon - block_size, size=n_blocks)
-            perm_indices = []
-            for start in block_starts:
-                for offset in range(block_size):
-                    idx = (start + offset) % (n_bars - horizon - 1)
-                    perm_indices.append(idx)
-            perm_indices = perm_indices[:n_events]
-
-            # Vectorized log return computation
-            perm_rets = []
-            for idx in perm_indices:
-                if idx + horizon < n_bars:
-                    perm_rets.append(log_close[idx + horizon] - log_close[idx])
-            if perm_rets:
-                perm_means[p] = float(np.mean(perm_rets))
-
-        p_val = float(np.mean(perm_means >= observed_mean))
-        return p_val
+        # Include the observed statistic for a finite-sample tail estimate.
+        return float((1 + np.sum(perm_means >= observed_mean)) / (n_perms + 1))
 
     # ── Regime analysis ─────────────────────────────────────────────────────
 
@@ -411,7 +430,7 @@ class EventStudy:
 
             results[sym] = {}
             for h in self.HORIZONS:
-                fwd_rets = self._compute_forward_returns(event_indices, h)
+                fwd_rets = self._compute_forward_returns(event_indices, h, df=df)
                 results[sym][h] = float(np.mean(fwd_rets)) if len(fwd_rets) > 0 else float("nan")
 
         return results
@@ -672,7 +691,7 @@ class EventStudy:
                 continue
 
             # Use h=5 as default horizon
-            rets = self._compute_forward_returns(events, 5)
+            rets = self._compute_forward_returns(events, 5, df=window_df)
             mean_bp = float(np.mean(rets)) * 10000
             std_bp = float(np.std(rets, ddof=1)) * 10000
             rolling_means.append(mean_bp)

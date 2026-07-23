@@ -1,9 +1,24 @@
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 import json
 from pathlib import Path
+import pandas as pd
+
+@dataclass
+class ConditioningEvidence:
+    confidence_delta: float
+    activation_score: float
+    rationale: str
+    diagnostics: Dict[str, Any]
+
+class ConditioningMechanism(ABC):
+    @abstractmethod
+    def evaluate(self, context: pd.DataFrame) -> ConditioningEvidence:
+        """Returns evidence for conditioning Primary mechanisms."""
+        pass
 
 @dataclass
 class BoundaryModel:
@@ -18,6 +33,28 @@ class BoundaryModel:
     ci_low: float
     ci_high: float
     sample_size: int
+    
+    # Lifecycle & Provenance
+    status: str = "DISCOVERED"  # DISCOVERED | CANDIDATE | VALIDATED | REPLICATED | PRODUCTION_APPROVED | RETIRED
+    candidate_source: str = "Unknown"
+    validation_report: str = ""
+    validated_by: List[str] = field(default_factory=list)
+    validated_on: List[str] = field(default_factory=list)
+    validated_pipeline_version: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def promote(self, pipeline_version: str, report_link: str, tests: List[str]):
+        if self.status == "VALIDATED":
+            raise ValueError(f"Cannot promote boundary {self.model_id}: already VALIDATED. Create a new version.")
+        
+        self.status = "VALIDATED"
+        self.validated_by.extend(tests)
+        self.validated_on.append(datetime.now(timezone.utc).isoformat())
+        self.validated_pipeline_version = pipeline_version
+        self.validation_report = report_link
+
+    def reject(self):
+        self.status = "REJECTED"
 
 @dataclass
 class EvidenceCard:
@@ -37,6 +74,7 @@ class MechanismRecord:
     causal_chain: List[str]
     scientific_rationale: str
     falsification_criteria: List[str]
+    role: str = "PRIMARY"  # PRIMARY | CONDITIONING | CONTEXT
     boundary_models: Dict[str, BoundaryModel] = field(default_factory=dict)
     evidence: Dict[str, EvidenceCard] = field(default_factory=dict)
     validation_history: List[str] = field(default_factory=list)  # References to EXP/NEG/D IDs

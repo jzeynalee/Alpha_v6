@@ -818,11 +818,19 @@ class ResearchPipeline:
         ci_lower = float(np.percentile(bootstrap_means, 100 * alpha / 2))
         ci_upper = float(np.percentile(bootstrap_means, 100 * (1 - alpha / 2)))
 
-        # P-value: fraction of bootstrap means <= 0 (one-sided for positive mean)
+        # Test the null of zero mean by centering before resampling. The
+        # uncentered bootstrap estimates sampling uncertainty, not a null p-value.
+        centered_returns = returns - observed_mean
+        null_means = np.zeros(n_bootstrap)
+        for i in range(n_bootstrap):
+            sample = rng.choice(centered_returns, size=n, replace=True)
+            null_means[i] = float(np.mean(sample))
+
+        # P-value: one-sided tail under the null of zero mean.
         if observed_mean > 0:
-            p_value = float(np.mean(bootstrap_means <= 0))
+            p_value = float((1 + np.sum(null_means >= observed_mean)) / (n_bootstrap + 1))
         else:
-            p_value = float(np.mean(bootstrap_means >= 0))
+            p_value = float((1 + np.sum(null_means <= observed_mean)) / (n_bootstrap + 1))
 
         return {
             "p_value": p_value,
@@ -864,9 +872,8 @@ class ResearchPipeline:
         mean_full = float(np.mean(returns))
         mean_trimmed = float(np.mean(trimmed))
 
-        # Approximate profit factor as exp(mean_return)
-        pf_full = float(np.exp(mean_full * 252)) if mean_full > -20 else 0.0
-        pf_trimmed = float(np.exp(mean_trimmed * 252)) if mean_trimmed > -20 else 0.0
+        pf_full = ResearchPipeline._profit_factor(returns)
+        pf_trimmed = ResearchPipeline._profit_factor(trimmed)
         pf_drop = abs(pf_full - pf_trimmed) / max(abs(pf_full), 1e-9)
 
         return {
@@ -902,8 +909,7 @@ class ResearchPipeline:
                 result[f"{regime.lower()}_pf"] = float("nan")
                 result[f"{regime.lower()}_n"] = len(rets)
                 continue
-            mean_ret = float(np.mean(rets))
-            pf = float(np.exp(mean_ret * 252)) if mean_ret > -20 else 0.0
+            pf = ResearchPipeline._profit_factor(rets)
             pf = round(pf, 4)
             result[f"{regime.lower()}_pf"] = pf
             result[f"{regime.lower()}_n"] = len(rets)
@@ -912,6 +918,17 @@ class ResearchPipeline:
         result["n_regimes_positive"] = n_positive
         result["total_regimes"] = len(returns_by_regime)
         return result
+
+    @staticmethod
+    def _profit_factor(returns: np.ndarray) -> float:
+        """Return gross profits divided by gross losses for a return series."""
+        returns = np.asarray(returns, dtype=float)
+        returns = returns[np.isfinite(returns)]
+        gross_profit = float(np.sum(returns[returns > 0]))
+        gross_loss = float(-np.sum(returns[returns < 0]))
+        if gross_loss == 0.0:
+            return float("inf") if gross_profit > 0.0 else 0.0
+        return gross_profit / gross_loss
 
 
 __all__ = [

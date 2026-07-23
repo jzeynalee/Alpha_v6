@@ -195,10 +195,15 @@ class PurgedWalkForward:
             # Training set is [0, purge_cutoff)
             train_indices = all_idx[:max(purge_cutoff, 0)]
 
-            # Embargo applies between this test segment and the NEXT
-            # training segment; it does not affect this fold's train.
-            # But it DOES affect how the next fold's test_start is chosen
-            # implicitly via test_size tiling — see assertion below.
+            # Exclude the configured embargo interval after the previous test
+            # segment from this fold's expanding training history.
+            if k > 0:
+                previous_test_end = test_size * k
+                embargo_cutoff = previous_test_end + self.embargo
+                train_indices = train_indices[
+                    (train_indices < previous_test_end)
+                    | (train_indices >= embargo_cutoff)
+                ]
 
             purged_from_naive = test_start - train_indices.size
             # Naive training would have been all_idx[:test_start]; the
