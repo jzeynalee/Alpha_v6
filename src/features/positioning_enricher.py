@@ -20,10 +20,12 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from src.core.paths import paths
+
 logger = logging.getLogger(__name__)
 
 # Path to v3_binance data
-_V3_BINANCE = Path("data/raw/v3_binance")
+_V3_BINANCE = paths.raw_dir / "v3_binance"
 
 # Cache loaded data to avoid repeated disk reads
 _data_cache: dict = {}
@@ -39,6 +41,20 @@ def _load_csv(path: Path) -> Optional[pd.DataFrame]:
     df = df.set_index("datetime").drop(columns=["timestamp"])
     df = df.sort_index()
     return df
+
+
+def _causal_reindex(source: pd.DataFrame, target_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Align source observations to target times without using future rows."""
+    source = source.sort_index()
+    target = pd.DataFrame(index=pd.DatetimeIndex(target_index).sort_values())
+    aligned = pd.merge_asof(
+        target.reset_index(names="datetime"),
+        source.reset_index(names="datetime"),
+        on="datetime",
+        direction="backward",
+        allow_exact_matches=False,
+    )
+    return aligned.set_index("datetime").reindex(target_index)
 
 
 def load_oi(symbol: str) -> Optional[pd.DataFrame]:
@@ -149,9 +165,9 @@ def enrich_ohlcv(
     if load_oi_data:
         oi_df = load_oi(symbol)
         if oi_df is not None:
-            # OI is 5-min data; resample to the OHLCV timeframe by forward-fill
-            # then reindex to match OHLCV index (nearest forward or backward)
-            oi_resampled = oi_df.reindex(ohlcv.index, method="ffill")
+            # OI is observed before the target bar; never use an observation
+            # stamped exactly at the target bar or any later observation.
+            oi_resampled = _causal_reindex(oi_df, ohlcv.index)
             for col in oi_resampled.columns:
                 ohlcv[col] = oi_resampled[col]
 
@@ -176,8 +192,8 @@ def enrich_ohlcv(
     if load_funding_data:
         fund_df = load_funding(symbol)
         if fund_df is not None:
-            # Forward-fill funding rate (8h data) to match OHLCV timestamps
-            fund_resampled = fund_df.reindex(ohlcv.index, method="ffill")
+            # Funding is aligned strictly from the most recent prior report.
+            fund_resampled = _causal_reindex(fund_df, ohlcv.index)
             ohlcv["funding_rate"] = fund_resampled["funding_rate"]
 
             # Derived funding features

@@ -44,6 +44,12 @@ from src.core.evidence_ladder import (
 from src.core.experiment_manager import ExperimentManager, ExperimentSpec, ExperimentResult
 from src.core.dataset_registry import registry as data_registry
 from src.cv.walk_forward import PurgedWalkForward
+from src.validation.statistics import (
+    bootstrap_metrics,
+    classify_regime as classify_regime_shared,
+    outlier_robustness,
+    regime_stability,
+)
 
 
 def scipy_norm_cdf(x: float) -> float:
@@ -65,83 +71,19 @@ def compute_dsr(sharpe_per_fold: np.ndarray, n_validations: int = 100) -> float:
 
 
 def compute_bootstrap_metrics(returns: np.ndarray, n_bootstrap: int = 2000, seed: int = 42) -> Dict[str, Any]:
-    rng = np.random.default_rng(seed)
-    n = len(returns)
-    if n < 10:
-        return {"p_value": 1.0, "ci_lower_95": -1.0, "ci_upper_95": 1.0, "mean": 0.0, "n_samples": n}
-    observed_mean = float(np.mean(returns))
-    bootstrap_means = np.zeros(n_bootstrap)
-    for i in range(n_bootstrap):
-        sample = rng.choice(returns, size=n, replace=True)
-        bootstrap_means[i] = float(np.mean(sample))
-    ci_lower = float(np.percentile(bootstrap_means, 2.5))
-    ci_upper = float(np.percentile(bootstrap_means, 97.5))
-    p_value = float(np.mean(bootstrap_means <= 0)) if observed_mean > 0 else 1.0
-    return {
-        "p_value": p_value,
-        "ci_lower_95": ci_lower,
-        "ci_upper_95": ci_upper,
-        "mean": observed_mean,
-        "std": float(np.std(returns, ddof=1)),
-        "n_samples": n,
-        "n_bootstrap": n_bootstrap,
-    }
+    return bootstrap_metrics(returns, n_bootstrap=n_bootstrap, seed=seed)
 
 
 def compute_outlier_robustness(returns: np.ndarray, trim_pct: float = 0.01) -> Dict[str, Any]:
-    if len(returns) < 20:
-        return {"pf_full": 0.0, "pf_trimmed": 0.0, "pf_drop_pct": 100.0}
-    sorted_returns = np.sort(returns)
-    n_trim = max(1, int(len(returns) * trim_pct))
-    trimmed = sorted_returns[n_trim:-n_trim] if len(returns) > 2 * n_trim else returns
-    mean_full = float(np.mean(returns))
-    mean_trimmed = float(np.mean(trimmed))
-    pf_full = float(np.exp(mean_full * 252)) if mean_full > -20 else 0.0
-    pf_trimmed = float(np.exp(mean_trimmed * 252)) if mean_trimmed > -20 else 0.0
-    pf_drop = abs(pf_full - pf_trimmed) / max(abs(pf_full), 1e-9)
-    return {
-        "pf_full": round(pf_full, 4),
-        "pf_trimmed": round(pf_trimmed, 4),
-        "pf_drop_pct": round(pf_drop * 100, 2),
-    }
+    return outlier_robustness(returns, trim_pct=trim_pct)
 
 
 def classify_regime(closes: pd.Series) -> List[str]:
-    momentum_20 = closes.pct_change(20)
-    # Compute rolling quantiles separately (avoid list arg incompatibility in some pandas versions)
-    bull_thresh = momentum_20.rolling(60).quantile(0.67)
-    bear_thresh = momentum_20.rolling(60).quantile(0.33)
-    regimes = []
-    for i in range(len(closes)):
-        m = momentum_20.iloc[i]
-        bt = bull_thresh.iloc[i]
-        br = bear_thresh.iloc[i]
-        if pd.isna(m) or pd.isna(bt) or pd.isna(br):
-            regimes.append("Neutral")
-        elif m > bt:
-            regimes.append("Bull")
-        elif m < br:
-            regimes.append("Bear")
-        else:
-            regimes.append("Neutral")
-    return regimes
+    return classify_regime_shared(closes)
 
 
 def compute_regime_stability(returns_by_regime: Dict[str, np.ndarray]) -> Dict[str, Any]:
-    result: Dict[str, Any] = {}
-    for regime, rets in returns_by_regime.items():
-        if len(rets) < 5:
-            result[f"{regime.lower()}_pf"] = float("nan")
-            result[f"{regime.lower()}_n"] = len(rets)
-            continue
-        mean_ret = float(np.mean(rets))
-        pf = float(np.exp(mean_ret * 252)) if mean_ret > -20 else 0.0
-        result[f"{regime.lower()}_pf"] = round(pf, 4)
-        result[f"{regime.lower()}_n"] = len(rets)
-    n_positive = sum(1 for k in result if k.endswith("_pf") and result.get(k, 0) > 1.0)
-    result["n_regimes_positive"] = n_positive
-    result["total_regimes"] = len(returns_by_regime)
-    return result
+    return regime_stability(returns_by_regime)
 
 
 def get_trade_returns(ohlcv: pd.DataFrame, signal_fn) -> np.ndarray:

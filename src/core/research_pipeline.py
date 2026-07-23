@@ -49,6 +49,12 @@ from src.core.evidence_ladder import (
     PipelineStage,
     StageResult,
 )
+from src.validation.statistics import (
+    bootstrap_metrics,
+    outlier_robustness,
+    profit_factor,
+    regime_stability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -795,52 +801,12 @@ class ResearchPipeline:
         seed : int
             Random seed for reproducibility.
         """
-        rng = np.random.default_rng(seed)
-        n = len(returns)
-        if n < 10:
-            return {
-                "p_value": 1.0,
-                "ci_lower_95": -1.0,
-                "ci_upper_95": -1.0,
-                "mean": 0.0,
-                "std": 0.0,
-                "n_samples": n,
-                "error": "Insufficient data (need >= 10 returns)",
-            }
-
-        observed_mean = float(np.mean(returns))
-        bootstrap_means = np.zeros(n_bootstrap)
-        for i in range(n_bootstrap):
-            sample = rng.choice(returns, size=n, replace=True)
-            bootstrap_means[i] = float(np.mean(sample))
-
-        alpha = 1.0 - confidence
-        ci_lower = float(np.percentile(bootstrap_means, 100 * alpha / 2))
-        ci_upper = float(np.percentile(bootstrap_means, 100 * (1 - alpha / 2)))
-
-        # Test the null of zero mean by centering before resampling. The
-        # uncentered bootstrap estimates sampling uncertainty, not a null p-value.
-        centered_returns = returns - observed_mean
-        null_means = np.zeros(n_bootstrap)
-        for i in range(n_bootstrap):
-            sample = rng.choice(centered_returns, size=n, replace=True)
-            null_means[i] = float(np.mean(sample))
-
-        # P-value: one-sided tail under the null of zero mean.
-        if observed_mean > 0:
-            p_value = float((1 + np.sum(null_means >= observed_mean)) / (n_bootstrap + 1))
-        else:
-            p_value = float((1 + np.sum(null_means <= observed_mean)) / (n_bootstrap + 1))
-
-        return {
-            "p_value": p_value,
-            "ci_lower_95": ci_lower,
-            "ci_upper_95": ci_upper,
-            "mean": observed_mean,
-            "std": float(np.std(returns, ddof=1)),
-            "n_samples": n,
-            "n_bootstrap": n_bootstrap,
-        }
+        return bootstrap_metrics(
+            returns,
+            n_bootstrap=n_bootstrap,
+            seed=seed,
+            confidence=confidence,
+        )
 
     # ── Outlier robustness helper ────────────────────────────────────────────
 
@@ -865,25 +831,7 @@ class ResearchPipeline:
                 "error": "Insufficient data (need >= 20 returns)",
             }
 
-        sorted_returns = np.sort(returns)
-        n_trim = max(1, int(len(returns) * trim_pct))
-        trimmed = sorted_returns[n_trim:-n_trim] if len(returns) > 2 * n_trim else returns
-
-        mean_full = float(np.mean(returns))
-        mean_trimmed = float(np.mean(trimmed))
-
-        pf_full = ResearchPipeline._profit_factor(returns)
-        pf_trimmed = ResearchPipeline._profit_factor(trimmed)
-        pf_drop = abs(pf_full - pf_trimmed) / max(abs(pf_full), 1e-9)
-
-        return {
-            "pf_full": round(pf_full, 4),
-            "pf_trimmed": round(pf_trimmed, 4),
-            "pf_drop_pct": round(pf_drop * 100, 2),
-            "mean_return_full": round(mean_full, 6),
-            "mean_return_trimmed": round(mean_trimmed, 6),
-            "n_trimmed_each_side": n_trim,
-        }
+        return outlier_robustness(returns, trim_pct=trim_pct)
 
     # ── Regime stability helper ──────────────────────────────────────────────
 
@@ -902,33 +850,10 @@ class ResearchPipeline:
 
         Returns dict with per-regime profit factor and count of positive regimes.
         """
-        result: Dict[str, Any] = {}
-        n_positive = 0
-        for regime, rets in returns_by_regime.items():
-            if len(rets) < 5:
-                result[f"{regime.lower()}_pf"] = float("nan")
-                result[f"{regime.lower()}_n"] = len(rets)
-                continue
-            pf = ResearchPipeline._profit_factor(rets)
-            pf = round(pf, 4)
-            result[f"{regime.lower()}_pf"] = pf
-            result[f"{regime.lower()}_n"] = len(rets)
-            if pf > 1.0:
-                n_positive += 1
-        result["n_regimes_positive"] = n_positive
-        result["total_regimes"] = len(returns_by_regime)
-        return result
+        return regime_stability(returns_by_regime)
 
     @staticmethod
-    def _profit_factor(returns: np.ndarray) -> float:
-        """Return gross profits divided by gross losses for a return series."""
-        returns = np.asarray(returns, dtype=float)
-        returns = returns[np.isfinite(returns)]
-        gross_profit = float(np.sum(returns[returns > 0]))
-        gross_loss = float(-np.sum(returns[returns < 0]))
-        if gross_loss == 0.0:
-            return float("inf") if gross_profit > 0.0 else 0.0
-        return gross_profit / gross_loss
+    _profit_factor = staticmethod(profit_factor)
 
 
 __all__ = [

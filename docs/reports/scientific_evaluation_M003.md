@@ -3,16 +3,16 @@
 
 ## Mechanism
 - **ID:** M003
-- **Description:** Position Unwind (Open Interest vs Price divergence).
+- **Description:** Position Unwind (Open Interest vs Price divergence) on high-quality regimes.
 
 ## Experimental Results
-- **Pipeline Stages Run:** 2
-- **Stages Passed:** 1
+- **Pipeline Stages Run:** 3
+- **Stages Passed:** 2
 - **Final Level:** Economic intuition only
 
 ## Boundary Models & Falsification
-- **Boundary Models:** []
-- **Falsification Criteria:** ['OI increases with price']
+- **Boundary Models:** ['M003_BTC_4h_Lookback5_B01', 'M003_BTC_4h_Lookback10_B02']
+- **Falsification Criteria:** ['OI increases with price during reversal']
 
 ## Evidence Gap
 - **Next High Info Gain Experiment:** {}
@@ -22,10 +22,10 @@
 ```json
 {
   "hypothesis_id": "M003_BTCUSDT_4h",
-  "started_at_level": "L0",
+  "started_at_level": "L3",
   "final_level": "L0",
-  "stages_run": 2,
-  "stages_passed": 1,
+  "stages_run": 3,
+  "stages_passed": 2,
   "stages_failed": 1,
   "final_level_label": "Economic intuition only",
   "results": [
@@ -33,7 +33,7 @@
       "stage": 1,
       "name": "Economic Explanation",
       "passed": true,
-      "timestamp": "2026-07-22T18:35:36.418181+00:00",
+      "timestamp": "2026-07-23T12:29:06.430172+00:00",
       "metrics": {
         "checks_passed": 6,
         "checks_total": 6,
@@ -49,10 +49,27 @@
     {
       "stage": 2,
       "name": "In-Sample Discovery",
+      "passed": true,
+      "timestamp": "2026-07-23T12:29:06.430172+00:00",
+      "metrics": {
+        "profit_factor": 1.1525705032328044,
+        "sharpe": 0.6551842696502319,
+        "win_rate": 0.375
+      },
+      "notes": "In-sample edge confirmed: PF=1.15, Sharpe=0.66"
+    },
+    {
+      "stage": 3,
+      "name": "Walk-Forward Validation",
       "passed": false,
-      "timestamp": "2026-07-22T18:35:36.418181+00:00",
-      "metrics": {},
-      "notes": "In-sample edge insufficient: PF=0.00 (need > 1.0). Run signal_factory_simulation.py to populate in-sample metrics."
+      "timestamp": "2026-07-23T12:29:06.430172+00:00",
+      "metrics": {
+        "n_windows": 8,
+        "mean_ir": -3.6766,
+        "ir_positive_prob": 0.25,
+        "dsr": -5.3171
+      },
+      "notes": "Walk-forward: 8/12 windows, mean_IR=-3.677, P(IR>0)=0.250, DSR=-5.317"
     }
   ]
 }

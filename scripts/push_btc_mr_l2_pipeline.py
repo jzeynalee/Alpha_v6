@@ -55,6 +55,12 @@ from src.core.research_pipeline import (
     _default_outlier_robustness,
 )
 from src.cv.walk_forward import PurgedWalkForward
+from src.validation.statistics import (
+    bootstrap_metrics,
+    classify_regime as classify_regime_shared,
+    outlier_robustness,
+    regime_stability,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Helpers: DSR, IR computation
@@ -91,97 +97,26 @@ def compute_bootstrap_metrics(
     seed: int = 42,
 ) -> Dict[str, Any]:
     """Bootstrap statistics for a returns series."""
-    rng = np.random.default_rng(seed)
-    n = len(returns)
-    if n < 10:
-        return {"p_value": 1.0, "ci_lower_95": -1.0, "n_samples": n}
-
-    observed_mean = float(np.mean(returns))
-    bootstrap_means = np.zeros(n_bootstrap)
-    for i in range(n_bootstrap):
-        sample = rng.choice(returns, size=n, replace=True)
-        bootstrap_means[i] = float(np.mean(sample))
-
-    ci_lower = float(np.percentile(bootstrap_means, 2.5))
-    ci_upper = float(np.percentile(bootstrap_means, 97.5))
-    p_value = float(np.mean(bootstrap_means <= 0)) if observed_mean > 0 else 1.0
-
-    return {
-        "p_value": p_value,
-        "ci_lower_95": ci_lower,
-        "ci_upper_95": ci_upper,
-        "mean": observed_mean,
-        "std": float(np.std(returns, ddof=1)),
-        "n_samples": n,
-        "n_bootstrap": n_bootstrap,
-    }
+    return bootstrap_metrics(returns, n_bootstrap=n_bootstrap, seed=seed)
 
 
 def compute_outlier_robustness(
     returns: np.ndarray, trim_pct: float = 0.01
 ) -> Dict[str, Any]:
     """Check performance sensitivity to outlier removal."""
-    if len(returns) < 20:
-        return {"pf_full": 0.0, "pf_trimmed": 0.0, "pf_drop_pct": 100.0}
-
-    sorted_returns = np.sort(returns)
-    n_trim = max(1, int(len(returns) * trim_pct))
-    trimmed = sorted_returns[n_trim:-n_trim] if len(returns) > 2 * n_trim else returns
-
-    mean_full = float(np.mean(returns))
-    mean_trimmed = float(np.mean(trimmed))
-    pf_full = float(np.exp(mean_full * 252)) if mean_full > -20 else 0.0
-    pf_trimmed = float(np.exp(mean_trimmed * 252)) if mean_trimmed > -20 else 0.0
-    pf_drop = abs(pf_full - pf_trimmed) / max(abs(pf_full), 1e-9)
-
-    return {
-        "pf_full": round(pf_full, 4),
-        "pf_trimmed": round(pf_trimmed, 4),
-        "pf_drop_pct": round(pf_drop * 100, 2),
-    }
+    return outlier_robustness(returns, trim_pct=trim_pct)
 
 
 def compute_regime_stability(
     returns_by_regime: Dict[str, np.ndarray],
 ) -> Dict[str, Any]:
     """Check performance across market regimes (Bull/Bear/Neutral)."""
-    result: Dict[str, Any] = {}
-    n_positive = 0
-    for regime, rets in returns_by_regime.items():
-        if len(rets) < 5:
-            result[f"{regime.lower()}_pf"] = float("nan")
-            result[f"{regime.lower()}_n"] = len(rets)
-            continue
-        mean_ret = float(np.mean(rets))
-        pf = float(np.exp(mean_ret * 252)) if mean_ret > -20 else 0.0
-        result[f"{regime.lower()}_pf"] = round(pf, 4)
-        result[f"{regime.lower()}_n"] = len(rets)
-        if pf > 1.0:
-            n_positive += 1
-    result["n_regimes_positive"] = n_positive
-    result["total_regimes"] = len(returns_by_regime)
-    return result
+    return regime_stability(returns_by_regime)
 
 
 def classify_regime(closes: pd.Series) -> List[str]:
     """Classify each bar into Bull / Bear / Neutral regime using rolling momentum."""
-    momentum_20 = closes.pct_change(20)
-    thresholds = momentum_20.rolling(60).quantile([0.33, 0.67]).values.T
-    bull_thresh = thresholds[:, 1]  # 67th percentile
-    bear_thresh = thresholds[:, 0]  # 33rd percentile
-
-    regimes = []
-    for i in range(len(closes)):
-        m = momentum_20.iloc[i]
-        if pd.isna(m):
-            regimes.append("Neutral")
-        elif m > bull_thresh[i]:
-            regimes.append("Bull")
-        elif m < bear_thresh[i]:
-            regimes.append("Bear")
-        else:
-            regimes.append("Neutral")
-    return regimes
+    return classify_regime_shared(closes)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

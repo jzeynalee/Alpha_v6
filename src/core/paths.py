@@ -97,6 +97,14 @@ class ArtifactPaths:
         return self._base / "raw"
 
     @property
+    def experiments_dir(self) -> Path:
+        return self._base / "experiments"
+
+    @property
+    def records_dir(self) -> Path:
+        return self._base / "records"
+
+    @property
     def runtime_dir(self) -> Path:
         return self._base / "runtime"
 
